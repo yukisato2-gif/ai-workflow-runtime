@@ -1,13 +1,13 @@
 {
   "document_type": "モニタリング記録",
-  "person_name": "山田太郎",
-  "implementation_date": "2024年6月15日",
+  "person_name": "高橋対愛",
+  "implementation_date": "2025年1月10日",
   "participants": [
-    "山田太郎（本人）",
-    "田中花子（サービス管理責任者）",
-    "佐藤次郎（相談支援専門員）"
+    "高橋対愛",
+    "仁木芳典",
+    "中村正明"
   ],
-  "next_monitoring_date": "2024年9月",
-  "author": "佐藤次郎",
-  "confidence": 0.97
+  "next_monitoring_date": "2026年3月",
+  "author": "仁木芳典・中村正明",
+  "confidence": 0.82
 }
