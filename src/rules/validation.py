@@ -4,36 +4,34 @@
 """
 
 from src.common import get_logger, ValidationError
-from src.schemas import ExtractionResult
+from src.schemas import MonitoringRecord
 
 logger = get_logger(__name__)
 
 
-def validate_extraction_result(result: ExtractionResult) -> None:
-    """抽出結果のバリデーションを行う。
+def validate_monitoring_record(record: MonitoringRecord) -> None:
+    """モニタリング記録の抽出結果を検証する。
 
     以下のルールを検証する:
-    - items が 1 件以上存在すること
-    - 全項目の confidence が 0.5 以上であること
+    - document_type が「モニタリング記録」であること
+    - confidence が 0.5 以上であること
 
     Args:
-        result: 検証対象の抽出結果。
+        record: 検証対象のモニタリング記録。
 
     Raises:
         ValidationError: バリデーションに失敗した場合。
     """
-    logger.info("Validating extraction result for: %s", result.source_file)
+    logger.info("Validating monitoring record: %s", record.person_name)
 
-    if len(result.items) == 0:
-        raise ValidationError("Extraction result has no items")
-
-    low_confidence_items = [
-        item for item in result.items if item.confidence < 0.5
-    ]
-    if low_confidence_items:
-        keys = [item.key for item in low_confidence_items]
+    if record.document_type != "モニタリング記録":
         raise ValidationError(
-            f"Low confidence items detected: {keys}"
+            f"Invalid document_type: expected 'モニタリング記録', got '{record.document_type}'"
         )
 
-    logger.info("Validation passed (%d items)", len(result.items))
+    if record.confidence < 0.5:
+        raise ValidationError(
+            f"Low confidence: {record.confidence}"
+        )
+
+    logger.info("Validation passed (confidence=%.2f)", record.confidence)

@@ -5,6 +5,7 @@
 
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -17,7 +18,9 @@ logger = get_logger(__name__)
 
 def main() -> None:
     """メイン関数。環境設定を読み込みワークフローを実行する。"""
-    load_dotenv()
+    # プロジェクトルートの .env を明示的に指定（既存環境変数も上書き）
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    load_dotenv(dotenv_path=env_path, override=True)
 
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     model = os.getenv("CLAUDE_MODEL", "claude-3-opus-20240229")
@@ -36,7 +39,7 @@ def main() -> None:
 
     try:
         result = run_sample_workflow(pdf_path=pdf_path, claude_client=claude_client)
-        logger.info("Workflow finished. Items extracted: %d", len(result.items))
+        logger.info("Workflow finished. person_name=%s, confidence=%.2f", result.person_name, result.confidence)
     except Exception as e:
         logger.error("Runtime error: %s", e)
         sys.exit(1)
