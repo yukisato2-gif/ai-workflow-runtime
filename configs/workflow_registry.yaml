@@ -1,0 +1,55 @@
+# ============================================================
+# ワークフロー台帳（workflow_registry.yaml）
+# ============================================================
+#
+# 目的：
+#   - 本リポジトリに存在するワークフローの一覧と実装場所を可視化する
+#   - cowork-assets との紐付けを将来的に行うための土台
+#
+# 注意：
+#   - この台帳は参照用であり、実行コードからは読み込まれません
+#   - 実装場所（runtime_location）は実在するファイルパスを記載しています
+#   - 不明な項目は TODO として残しています
+#
+# 更新日: 2026-04-10
+# ============================================================
+
+workflows:
+
+  - id: WF-001
+    name: モニタリング記録抽出
+    description: >
+      PDF からモニタリング記録を OCR + Claude で抽出し、
+      バリデーション後に Google Sheets へ書き込む。
+    runtime_location: src/workflows/monitoring_record/workflow.py
+    entry_point: python -m src.main
+    status: active
+    cowork_assets_ref: TODO
+    notes: >
+      旧名 sample_workflow から monitoring_record へ rename 済み。
+
+  - id: WF-002
+    name: 担当者会議録バッチ
+    description: >
+      指定フォルダ内の会議録 PDF を一括で OCR + Claude 抽出し、
+      Google Sheets へ書き込む。登録済みファイルはスキップ。
+    runtime_location: src/workflows/meeting_record/workflow.py
+    entry_point: python scripts/batch_meeting.py <フォルダパス>
+    status: active
+    cowork_assets_ref: TODO
+    notes: >
+      ワークフロー本体を src/workflows/meeting_record/ へ切り出し済み。
+      scripts/batch_meeting.py は CLI入口・バッチ制御として維持。
+
+  - id: WF-003
+    name: 複数拠点巡回処理
+    description: >
+      親フォルダ配下の拠点フォルダ（GH を含む）を巡回し、
+      各拠点の対象サブフォルダ内 PDF を WF-002 で処理する。
+    runtime_location: scripts/scan_sites.py
+    entry_point: python scripts/scan_sites.py <親フォルダパス>
+    status: active
+    cowork_assets_ref: TODO
+    notes: >
+      独立したワークフローではなく、WF-002 を複数拠点に対して実行する
+      巡回オーケストレーション。内部で scripts.batch_meeting.process_single_pdf を呼び出す。
