@@ -32,12 +32,14 @@ def _extract_site_name(pdf_path: str) -> str:
         拠点名（GH○○）。取得不可時は「不明」。
     """
     try:
-        parent_name = Path(pdf_path).parent.name
-        match = re.search(r"(GH.+)", parent_name)
-        if match:
-            site_name = match.group(1)
-            logger.info("拠点抽出: %s", site_name)
-            return site_name
+        current = Path(pdf_path).parent
+        while current != current.parent:
+            match = re.search(r"(GH.+)", current.name)
+            if match:
+                site_name = match.group(1)
+                logger.info("拠点抽出: %s", site_name)
+                return site_name
+            current = current.parent
     except Exception as e:
         logger.warning("拠点名の抽出に失敗: %s", e)
 
@@ -211,6 +213,48 @@ def append_meeting_result_to_sheet(
             return
 
         worksheet.append_row(row, value_input_option="USER_ENTERED")
+
+        # 表示設定: 行高さ固定 + M列（13列目）折り返しOFF・クリップ表示
+        try:
+            sheet_id = worksheet.id
+            spreadsheet.batch_update({
+                "requests": [
+                    # 全行の高さを50pxに固定
+                    {
+                        "updateDimensionProperties": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "ROWS",
+                                "startIndex": 1,  # ヘッダー行は除く
+                            },
+                            "properties": {
+                                "pixelSize": 50,
+                            },
+                            "fields": "pixelSize",
+                        }
+                    },
+                    # M列（index=12）を折り返しOFF・クリップ表示
+                    {
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startColumnIndex": 12,
+                                "endColumnIndex": 13,
+                                "startRowIndex": 1,
+                            },
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "wrapStrategy": "CLIP",
+                                }
+                            },
+                            "fields": "userEnteredFormat.wrapStrategy",
+                        }
+                    },
+                ]
+            })
+            logger.info("Sheet format applied: row height=50px, M column=CLIP")
+        except Exception as e:
+            logger.warning("Sheet format failed (non-critical): %s", e)
 
         logger.info("Sheets append success: %s → %s (row for %s)", MEETING_SHEET_NAME, SPREADSHEET_ID, pdf_filename)
 
