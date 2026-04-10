@@ -1,14 +1,10 @@
-"""担当者会議録バッチ処理スクリプト。
+"""個別支援計画書本案バッチ処理スクリプト。
 
 指定フォルダ内の全PDFを順番に処理し、
 OCR → 抽出 → Google Sheets 書き込みを行う。
-重複ファイルは既存の重複防止機能によりスキップされる。
 
 使い方:
-    python scripts/batch_meeting.py <フォルダパス>
-
-例:
-    python scripts/batch_meeting.py input/meeting_records
+    python scripts/batch_final_plan.py <フォルダパス>
 """
 
 import json
@@ -16,7 +12,6 @@ import os
 import sys
 from pathlib import Path
 
-# プロジェクトルートを sys.path に追加
 _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root))
 
@@ -25,55 +20,54 @@ from dotenv import load_dotenv
 from src.common import get_logger
 from src.clients.claude import ClaudeClient
 from src.tools.pdf_preprocess import extract_text_from_pdf
-from src.tools.sheets_writer import append_meeting_result_to_sheet
+from src.tools.sheets_writer import append_final_plan_result_to_sheet
 
 logger = get_logger(__name__)
 
-# extraction-prompt-meeting.md の完成版プロンプト本文
-MEETING_PROMPT_TEMPLATE = """\
-以下のテキストは担当者会議録PDFからOCRで抽出したものです。
+FINAL_PLAN_PROMPT_TEMPLATE = """\
+以下のテキストは個別支援計画書本案PDFからOCRで抽出したものです。
 下記のルールに従い、基本情報をJSON形式で抽出してください。
 
 【抽出する項目】
-1. meeting_date: 開催日
-2. meeting_time: 開催時間
-3. recorder: 記載者
-4. location: 開催場所
-5. participants: 参加者（配列で返す）
-6. plan_period_start: 計画期間の開始日
-7. plan_period_end: 計画期間の終了日
-8. person_name: 利用者名
+1. home_name: ホーム名（グループホーム名・事業所名）
+2. creation_date: 作成日
+3. plan_period_start: 計画期間の開始日
+4. plan_period_end: 計画期間の終了日
+5. author: 作成者名
+6. consent_date: 同意日
+7. has_signature: 利用者の署名の有無（有 / 無 / 不明）
+8. has_seal: 利用者の捺印の有無（有 / 無 / 不明）
 
 【抽出ルール】
 - 各項目は帳票上の明示的なラベルに紐づく値のみを抽出してください
-- 「開催日」と書かれた日付のみを meeting_date にしてください。「作成日」「記載日」等は絶対に使わないでください
-- 「開催時間」と書かれた時間帯のみを meeting_time にしてください
-- 「記載者」「作成者」「記録者」と書かれた名前のみを recorder にしてください。署名欄は対象外です
-- 「開催場所」と書かれた値のみを location にしてください
-- 参加者は帳票記載どおりに配列で返してください。肩書きもそのまま含めてください
+- 「ホーム名」「グループホーム名」「事業所名」と書かれた値を home_name にしてください
+- 「作成日」と書かれた日付のみを creation_date にしてください。「実施日」「開催日」等は絶対に使わないでください
 - 計画期間は必ず開始日と終了日に分割してください。「〜」「～」で区切られた期間の前半を plan_period_start、後半を plan_period_end にしてください
 - 分割できない場合は plan_period_start に全体を入れ、plan_period_end は null にしてください
+- 「作成者」「サービス管理責任者」と書かれた名前を author にしてください。署名欄は対象外です
+- 「同意日」「同意年月日」と書かれた日付を consent_date にしてください。記載がなければ null にしてください
+- 利用者署名欄に何らかの記載があれば has_signature を「有」、空欄なら「無」、OCRで判定できなければ「不明」にしてください
+- 利用者捺印欄に印影があれば has_seal を「有」、空欄なら「無」、OCRで判定できなければ「不明」にしてください
+- 署名・捺印の内容（筆跡・印影）は読み取らないでください
 - 帳票に記載がない項目は null にしてください
 - 推測で値を埋めないでください
 - OCRの誤字を勝手に修正しないでください
-- 署名・捺印の内容は読み取らないでください
 - 上記8項目以外は返さないでください
 
 【出力形式】
 - JSONのみを返してください
 - 説明文は付けないでください
 - コードブロックで囲まないでください
-- 以下のキー構造を必ず守ってください
 
 {{
-  "meeting_date": null,
-  "meeting_time": null,
-  "recorder": null,
-  "location": null,
-  "participants": null,
+  "home_name": null,
+  "creation_date": null,
   "plan_period_start": null,
   "plan_period_end": null,
-  "person_name": null
+  "author": null,
+  "consent_date": null,
+  "has_signature": "不明",
+  "has_seal": "不明"
 }}
 
 【入力テキスト】
@@ -82,38 +76,22 @@ MEETING_PROMPT_TEMPLATE = """\
 
 
 def process_single_pdf(pdf_path: str, claude_client: ClaudeClient) -> bool:
-    """担当者会議録PDF1件を処理する。
-
-    Args:
-        pdf_path: PDFファイルのフルパス。
-        claude_client: Claude API クライアント。
-
-    Returns:
-        True: 正常処理完了、False: 失敗。
-    """
+    """個別支援計画書本案PDF1件を処理する。"""
     try:
         pdf_name = Path(pdf_path).name
         logger.info("Processing: %s", pdf_name)
 
-        # OCR
         text = extract_text_from_pdf(pdf_path)
-
-        # Claude 抽出
-        prompt = MEETING_PROMPT_TEMPLATE.format(ocr_text=text)
+        prompt = FINAL_PLAN_PROMPT_TEMPLATE.format(ocr_text=text)
         result = claude_client.send_message_json(prompt)
 
-        # result.json 保存
         output_dir = Path("output")
         output_dir.mkdir(parents=True, exist_ok=True)
-        result_file = output_dir / "result.json"
-        result_file.write_text(
-            json.dumps(result, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        Path("output/result.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8",
         )
 
-        # Sheets 追記（重複防止は内部で処理）
-        append_meeting_result_to_sheet(pdf_path=pdf_path)
-
+        append_final_plan_result_to_sheet(pdf_path=pdf_path)
         return True
 
     except Exception as e:
@@ -122,9 +100,9 @@ def process_single_pdf(pdf_path: str, claude_client: ClaudeClient) -> bool:
 
 
 def main() -> None:
-    """メイン関数。指定フォルダ内のPDFをバッチ処理する。"""
+    """メイン関数。"""
     if len(sys.argv) < 2:
-        print("Usage: python scripts/batch_meeting.py <folder_path>")
+        print("Usage: python scripts/batch_final_plan.py <folder_path>")
         sys.exit(1)
 
     folder_path = Path(sys.argv[1])
@@ -132,7 +110,6 @@ def main() -> None:
         logger.error("Folder not found: %s", folder_path)
         sys.exit(1)
 
-    # 環境変数読み込み
     env_path = _project_root / ".env"
     load_dotenv(dotenv_path=env_path, override=True)
 
@@ -143,35 +120,24 @@ def main() -> None:
         logger.error("ANTHROPIC_API_KEY is not set")
         sys.exit(1)
 
-    # PDF一覧取得
     pdfs = sorted(folder_path.glob("*.pdf"))
     if not pdfs:
         logger.info("No PDF files found in %s", folder_path)
         return
 
     logger.info("Batch start: %d PDFs in %s", len(pdfs), folder_path)
-
     claude_client = ClaudeClient(api_key=api_key, model=model)
 
-    # 処理カウンタ
     success_count = 0
-    skip_count = 0
     fail_count = 0
 
     for pdf in pdfs:
-        pdf_str = str(pdf)
-        result = process_single_pdf(pdf_str, claude_client)
-        if result:
+        if process_single_pdf(str(pdf), claude_client):
             success_count += 1
         else:
             fail_count += 1
 
-    # サマリ出力
-    # skip_count は Sheets 側のログで確認（重複スキップは append 内で処理）
-    logger.info(
-        "Batch complete: total=%d, success=%d, fail=%d",
-        len(pdfs), success_count, fail_count,
-    )
+    logger.info("Batch complete: total=%d, success=%d, fail=%d", len(pdfs), success_count, fail_count)
 
 
 if __name__ == "__main__":
