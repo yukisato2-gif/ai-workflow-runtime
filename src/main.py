@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 from src.common import get_logger
 from src.clients.claude import ClaudeClient
-from src.workflows.sample_workflow import run_sample_workflow
+from src.workflows.monitoring_record import run_monitoring_record_workflow
 
 logger = get_logger(__name__)
 
@@ -38,7 +38,7 @@ def main() -> None:
     claude_client = ClaudeClient(api_key=api_key, model=model)
 
     try:
-        result = run_sample_workflow(pdf_path=pdf_path, claude_client=claude_client)
+        result = run_monitoring_record_workflow(pdf_path=pdf_path, claude_client=claude_client)
         logger.info("Workflow finished. person_name=%s, confidence=%.2f", result.person_name, result.confidence)
     except Exception as e:
         logger.error("Runtime error: %s", e)
