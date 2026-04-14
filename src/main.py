@@ -24,8 +24,9 @@ def main() -> None:
 
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     model = os.getenv("CLAUDE_MODEL", "claude-3-opus-20240229")
+    pdf_read_mode = os.getenv("PDF_READ_MODE", "api")
 
-    if not api_key:
+    if not api_key and pdf_read_mode != "browser":
         logger.error("ANTHROPIC_API_KEY is not set")
         sys.exit(1)
 
@@ -34,8 +35,11 @@ def main() -> None:
 
     logger.info("Starting ai-workflow-runtime")
     logger.info("Model: %s", model)
+    logger.info("PDF read mode: %s", pdf_read_mode)
 
-    claude_client = ClaudeClient(api_key=api_key, model=model)
+    # browser モードでは ClaudeClient は使用しないが、
+    # ワークフロー関数のシグネチャを維持するためダミーで渡す
+    claude_client = ClaudeClient(api_key=api_key or "unused", model=model) if api_key else None
 
     try:
         result = run_monitoring_record_workflow(pdf_path=pdf_path, claude_client=claude_client)

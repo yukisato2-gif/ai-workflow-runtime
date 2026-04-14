@@ -5,6 +5,7 @@
 """
 
 import json
+import os
 from pathlib import Path
 
 from src.common import get_logger
@@ -82,12 +83,22 @@ def process_single_pdf(pdf_path: str, claude_client: ClaudeClient) -> bool:
         pdf_name = Path(pdf_path).name
         logger.info("Processing: %s", pdf_name)
 
-        # OCR
-        text = extract_text_from_pdf(pdf_path)
+        # --- 方式分岐 (PDF_READ_MODE 環境変数で切替。デフォルト: api) ---
+        _pdf_read_mode = os.getenv("PDF_READ_MODE", "api")
 
-        # Claude 抽出
-        prompt = MEETING_PROMPT_TEMPLATE.format(ocr_text=text)
-        result = claude_client.send_message_json(prompt)
+        if _pdf_read_mode == "browser":
+            # ブラウザ方式: PDF を Claude Web UI に渡して直接 JSON 抽出
+            logger.info("Browser mode - extracting via Claude Web UI: %s", pdf_name)
+            from src.tools.pdf_preprocess.browser_reader import extract_json_via_browser
+            result = extract_json_via_browser(pdf_path, MEETING_PROMPT_TEMPLATE)
+        else:
+            # API 方式 (デフォルト): 既存処理そのまま
+            # OCR
+            text = extract_text_from_pdf(pdf_path)
+
+            # Claude 抽出
+            prompt = MEETING_PROMPT_TEMPLATE.format(ocr_text=text)
+            result = claude_client.send_message_json(prompt)
 
         # result.json 保存
         output_dir = Path("output")

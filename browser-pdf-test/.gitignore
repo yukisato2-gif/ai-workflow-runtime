@@ -1,0 +1,11 @@
+# ブラウザセッションデータ (ログイン情報を含む)
+.browser_data/
+
+# 実行時生成ファイル
+output/
+test.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/

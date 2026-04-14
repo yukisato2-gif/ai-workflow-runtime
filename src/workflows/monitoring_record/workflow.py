@@ -8,6 +8,7 @@ JSON として構造化抽出し、バリデーションを経て結果を保存
 """
 
 import json
+import os
 from pathlib import Path
 
 from src.common import get_logger, WorkflowError
@@ -87,14 +88,24 @@ def run_monitoring_record_workflow(pdf_path: str, claude_client: ClaudeClient) -
         WorkflowError: ワークフロー実行中にエラーが発生した場合。
     """
     try:
-        # STEP1: PDF テキスト抽出
-        logger.info("STEP1: Extracting text from PDF")
-        raw_text = extract_text_from_pdf(pdf_path)
+        # --- 方式分岐 (PDF_READ_MODE 環境変数で切替。デフォルト: api) ---
+        _pdf_read_mode = os.getenv("PDF_READ_MODE", "api")
 
-        # STEP2: Claude でモニタリング記録の基本情報を JSON 抽出
-        logger.info("STEP2: Sending text to Claude for monitoring record extraction")
-        prompt = EXTRACTION_PROMPT_TEMPLATE.format(ocr_text=raw_text)
-        extracted_json = claude_client.send_message_json(prompt)
+        if _pdf_read_mode == "browser":
+            # ブラウザ方式: PDF を Claude Web UI に渡して直接 JSON 抽出
+            logger.info("STEP1+2: Browser mode - extracting via Claude Web UI")
+            from src.tools.pdf_preprocess.browser_reader import extract_json_via_browser
+            extracted_json = extract_json_via_browser(pdf_path, EXTRACTION_PROMPT_TEMPLATE)
+        else:
+            # API 方式 (デフォルト): 既存処理そのまま
+            # STEP1: PDF テキスト抽出
+            logger.info("STEP1: Extracting text from PDF")
+            raw_text = extract_text_from_pdf(pdf_path)
+
+            # STEP2: Claude でモニタリング記録の基本情報を JSON 抽出
+            logger.info("STEP2: Sending text to Claude for monitoring record extraction")
+            prompt = EXTRACTION_PROMPT_TEMPLATE.format(ocr_text=raw_text)
+            extracted_json = claude_client.send_message_json(prompt)
 
         # extraction-prompt.md のキーとスキーマの差分を吸収
         # プロンプトが返さないフィールドを補完
