@@ -30,6 +30,14 @@ def main() -> None:
         logger.error("ANTHROPIC_API_KEY is not set")
         sys.exit(1)
 
+    # browser モードの誤実行防止 (CI/サーバー/cron 等の非GUI環境での事故防止)
+    if pdf_read_mode == "browser" and os.getenv("ALLOW_BROWSER_MODE") != "true":
+        logger.error(
+            "browser モードにはGUI環境と明示許可が必要です。"
+            " 環境変数 ALLOW_BROWSER_MODE=true を設定してください。"
+        )
+        sys.exit(1)
+
     # TODO: PDF パスは将来的に引数 or 設定ファイルから取得する
     pdf_path = "sample.pdf"
 
