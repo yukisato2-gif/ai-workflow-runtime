@@ -53,3 +53,18 @@ workflows:
     notes: >
       独立したワークフローではなく、WF-002 を複数拠点に対して実行する
       巡回オーケストレーション。内部で scripts.batch_meeting.process_single_pdf を呼び出す。
+
+  - id: WF-004
+    name: 個別支援計画関連書類PDF抽出
+    description: >
+      対象フォルダ配下の 5帳票（アセスメント / 個別支援計画書案 / 担当者会議録 /
+      個別支援計画書本案 / モニタリング）PDF を書類種別判定し、
+      Claude ブラウザ自動化で抽出・正規化の上、Google Sheets へ追記する。
+    runtime_location: src/workflows/support_plan_pdf_extraction/workflow.py
+    entry_point: python scripts/run_support_plan.py
+    status: poc
+    cowork_assets_ref: 20_部署スキル/運営監査課_operations-audit/個別支援計画抽出_pdf-extraction-support-plan
+    notes: >
+      PoC 最小実装。書類種別判定はファイル名キーワードベース。
+      判定不能は review_required=true でシートに記録する。
+      処理済みファイルは output/support_plan_state.json に記録し、再実行時にスキップ。
