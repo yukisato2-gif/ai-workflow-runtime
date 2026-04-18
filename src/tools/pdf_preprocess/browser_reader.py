@@ -145,11 +145,12 @@ def read_pdf_via_browser(pdf_path: str, prompt: str) -> str:
     pdf_abs = str(Path(pdf_path).resolve())
     python_path = _resolve_python()
 
-    logger.info("ブラウザ方式 PDF 読取開始")
+    logger.info("Claude ブラウザへ PDF 添付・読取開始 (Web UI 方式)")
     logger.info("  PDF: %s", pdf_abs)
     logger.info("  スクリプト: %s", _RUN_SCRIPT)
     logger.info("  Python: %s", python_path)
     logger.info("  タイムアウト: %d 秒", BROWSER_TIMEOUT_SEC)
+    logger.info("  (失敗時は browser-pdf-test/output/error.log と fail_*.png を参照)")
 
     # --- 名前付き引数で呼び出す (CLI 契約に基づく安定呼出) ---
     # プロンプトはファイル経由で渡す (長文プロンプトの引数長上限を回避)
@@ -228,7 +229,11 @@ def read_pdf_via_browser(pdf_path: str, prompt: str) -> str:
                 "browser-pdf-test/test.log を確認してください。"
             )
 
-        logger.info("ブラウザ方式 PDF 読取完了 (%d 文字)", len(response_text))
+        logger.info("Claude ブラウザ添付・読取完了 (%d 文字)", len(response_text))
+        # 成功時でも run_test.py の stdout 末尾をデバッグ出力 (追跡用)
+        if proc.stdout:
+            stdout_tail = proc.stdout[-300:]
+            logger.debug("run_test.py stdout (tail): %s", stdout_tail)
         return response_text
 
     finally:

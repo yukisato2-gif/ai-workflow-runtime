@@ -61,6 +61,7 @@ def run_support_plan_workflow(
 
     logger.info("=" * 60)
     logger.info("  Support Plan PDF Extraction Workflow")
+    logger.info("  (方式: ローカルPDFを Claude ブラウザへ添付して読む)")
     logger.info("=" * 60)
     logger.info("Target folder: %s", folder)
 
@@ -100,7 +101,9 @@ def run_support_plan_workflow(
             # 2. プロンプト読込
             prompt = load_prompt(doc_type)
 
-            # 3. Claude 実行 (ブラウザ自動化)
+            # 3. Claude 実行 (ブラウザ自動化: PDF を Web UI に添付)
+            logger.info("Claude ブラウザへ PDF 添付処理を開始: %s (type=%s)",
+                        pdf_path.name, doc_type)
             response = run_claude_on_pdf(pdf_path, prompt)
 
             # 4. JSON パース

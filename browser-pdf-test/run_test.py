@@ -366,6 +366,39 @@ async def upload_pdf(page, pdf_path: Path) -> None:
     log.info("[Upload] PDF アップロード開始: %s (%d bytes)",
              pdf_path.name, pdf_path.stat().st_size)
 
+    # --- 事前診断: アップロード UI を持つ画面にいるか確認 ---
+    try:
+        cur_url = page.url
+        cur_title = await page.title()
+        log.info("[Upload] 事前診断: URL=%s", cur_url)
+        log.info("[Upload] 事前診断: title=%s", cur_title)
+
+        # 画面種別の簡易判定
+        if "login" in cur_url:
+            log.warning("[Upload] ログイン画面にいます。添付できません。")
+        elif "/chat/" in cur_url or "/chats" in cur_url:
+            log.info("[Upload] 既存チャット画面にいます (新規ではない)")
+        elif cur_url.rstrip("/").endswith("claude.ai"):
+            log.info("[Upload] Claude トップ画面 (履歴) にいる可能性")
+        elif "/new" in cur_url:
+            log.info("[Upload] /new 画面にいます (想定通り)")
+        else:
+            log.warning("[Upload] 想定外の画面にいる可能性: %s", cur_url)
+
+        # 主要要素の検出数 (アップロード UI の有無)
+        id_count = await page.locator("#chat-input-file-upload-onpage").count()
+        file_input_count = await page.locator('input[type="file"]').count()
+        plus_count = await page.locator(
+            'button[aria-label*="追加"], button[aria-label*="ファイル"]'
+        ).count()
+        log.info(
+            "[Upload] 主要要素: #chat-input-file-upload-onpage=%d, "
+            "input[type=file]=%d, +/ファイルボタン=%d",
+            id_count, file_input_count, plus_count,
+        )
+    except Exception as e:
+        log.warning("[Upload] 事前診断に失敗: %s", e)
+
     uploaded = False
     tried: list[str] = []
 

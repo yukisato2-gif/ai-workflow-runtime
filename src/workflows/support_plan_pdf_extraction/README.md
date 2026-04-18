@@ -1,8 +1,28 @@
 # 個別支援計画関連書類 PDF 抽出 Workflow (PoC)
 
 運営監査課向け。
-Drive 上（ローカル同期）の対象フォルダから個別支援計画関連 PDF を取得し、
-書類種別判定 → Claude ブラウザ自動化で抽出 → 正規化 → Google Sheets 追記、までを行う。
+
+## 処理方式 (重要)
+
+本 workflow は **Claude API を使わず、ローカル同期済みの PDF を Claude Web UI に
+Playwright 経由で添付アップロードして読ませる方式** である。
+
+```
+[Google Drive (ローカル同期フォルダ)]
+   ↓ list_pdfs (ファイルシステム列挙)
+[ローカル PDF ファイル]
+   ↓ Playwright で CDP 接続した Chrome の Claude チャット画面へ添付
+[Claude Web UI の応答テキスト]
+   ↓ JSON パース + 正規化
+[Google Sheets]
+```
+
+- Drive API から直接 PDF を読むわけではない
+- Claude API も使わない
+- 添付アップロードの成否は Claude.ai の UI 変更・画面状態・セッション状態に依存する
+- 失敗時のエラー「PDF アップロードに失敗しました」は **Claude ブラウザへの添付失敗** を意味する
+
+書類種別判定 → Claude ブラウザ添付・抽出 → 正規化 → Google Sheets 追記、までを行う。
 
 | 項目 | 値 |
 |------|---|
