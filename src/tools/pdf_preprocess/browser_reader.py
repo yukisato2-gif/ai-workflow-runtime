@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from src.common import get_logger, WorkflowError
@@ -42,6 +43,11 @@ _RUN_SCRIPT = BROWSER_TEST_DIR / "run_test.py"
 
 # サブプロセスタイムアウト (秒)
 BROWSER_TIMEOUT_SEC = int(os.getenv("BROWSER_TIMEOUT_SEC", "300"))
+
+# サブプロセス終了後の cooldown (秒)
+# CDP 接続先 Chrome のタブ遷移が完了する前に次の run_test.py が
+# 起動するのを防ぐ。
+BROWSER_POST_WAIT_SEC = int(os.getenv("BROWSER_POST_WAIT_SEC", "2"))
 
 
 # =====================================================================
@@ -234,6 +240,12 @@ def read_pdf_via_browser(pdf_path: str, prompt: str) -> str:
         if proc.stdout:
             stdout_tail = proc.stdout[-300:]
             logger.debug("run_test.py stdout (tail): %s", stdout_tail)
+
+        # サブプロセス終了後の cooldown (連続実行時の navigation abort 防止)
+        if BROWSER_POST_WAIT_SEC > 0:
+            logger.info("subprocess 後 cooldown %d 秒開始", BROWSER_POST_WAIT_SEC)
+            time.sleep(BROWSER_POST_WAIT_SEC)
+            logger.info("subprocess 後 cooldown 終了")
         return response_text
 
     finally:

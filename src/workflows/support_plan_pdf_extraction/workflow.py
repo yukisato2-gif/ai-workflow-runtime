@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import os
+import time
 import traceback
 from pathlib import Path
 
@@ -34,6 +35,10 @@ from src.workflows.support_plan_pdf_extraction.sheets_writer import append_row
 from src.workflows.support_plan_pdf_extraction.state_store import StateStore
 
 logger = get_logger(__name__)
+
+# Claude 呼出後の待機秒数 (連続実行時の navigation abort 防止用)
+# 環境変数 SUPPORT_PLAN_POST_CLAUDE_SLEEP で上書き可能
+POST_CLAUDE_SLEEP_SEC = int(os.getenv("SUPPORT_PLAN_POST_CLAUDE_SLEEP", "5"))
 
 
 def run_support_plan_workflow(
@@ -105,6 +110,13 @@ def run_support_plan_workflow(
             logger.info("Claude ブラウザへ PDF 添付処理を開始: %s (type=%s)",
                         pdf_path.name, doc_type)
             response = run_claude_on_pdf(pdf_path, prompt)
+
+            # 3.5 連続実行時の navigation abort 防止のため待機
+            # (Playwright CDP の前の遷移が完了する前に次の goto が走るのを防ぐ)
+            logger.info("sleep %d 秒開始 (次のPDF処理までのクールダウン)",
+                        POST_CLAUDE_SLEEP_SEC)
+            time.sleep(POST_CLAUDE_SLEEP_SEC)
+            logger.info("sleep 終了")
 
             # 4. JSON パース
             raw = parse_claude_response(response)

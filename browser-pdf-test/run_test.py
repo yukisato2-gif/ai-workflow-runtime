@@ -800,17 +800,25 @@ async def run(pdf_path: Path, prompt: str, output_path: Path | None = None) -> N
         log.info("既存 Chrome への接続に成功 (ページ数: %d)", len(context.pages))
 
         try:
-            # Step 1: Claude.ai に遷移
-            log.info("[Step 1/6] Claude.ai に遷移中...")
-            await page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=30_000)
+            # Step 1: Claude.ai に遷移 (既に claude.ai/new なら goto しない)
+            log.info("[Step 1/6] Claude.ai に遷移... 現在URL=%s", page.url)
+            if "claude.ai/new" not in page.url:
+                log.info("[Step 1/6] goto 実行: %s", CLAUDE_URL)
+                await page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=30_000)
+            else:
+                log.info("[Step 1/6] 既に /new のため goto をスキップ")
 
             # Step 2: ログイン確認
             log.info("[Step 2/6] ログイン確認...")
             await wait_for_login(page)
 
-            # Step 3: 新規チャット画面に遷移
-            log.info("[Step 3/6] 新規チャット画面に遷移...")
-            await page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=30_000)
+            # Step 3: 新規チャット画面に遷移 (既に /new ならスキップ)
+            log.info("[Step 3/6] 新規チャット画面に遷移... 現在URL=%s", page.url)
+            if "claude.ai/new" not in page.url:
+                log.info("[Step 3/6] goto 実行: %s", CLAUDE_URL)
+                await page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=30_000)
+            else:
+                log.info("[Step 3/6] 既に /new のため goto をスキップ")
             await page.wait_for_timeout(2_000)
 
             # Step 4: PDF アップロード
