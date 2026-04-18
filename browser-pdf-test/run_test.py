@@ -76,16 +76,27 @@ LOGIN_CHECK_SELECTORS = [
 ]
 
 # 添付ボタン: ファイルアップロード用ボタン
+# Claude.ai の UI 変更時はここを更新する
 ATTACH_BUTTON_SELECTORS = [
+    # --- ID ベース (最も安定) ---
+    '#chat-input-file-upload-onpage',
+    # --- aria-label ベース (日本語 UI) ---
+    'button[aria-label*="ファイルをアップロード"]',
+    'button[aria-label*="ファイルやコネクタ"]',
+    'button[aria-label*="追加"]',
+    # --- aria-label ベース (英語 UI) ---
     'button[aria-label*="Attach"]',
-    'button[aria-label*="attach"]',
-    'button[aria-label*="file"]',
-    'button[aria-label*="File"]',
     'button[aria-label*="Upload"]',
-    'button[aria-label*="upload"]',
+    'button[aria-label*="Add file"]',
+    'button[aria-label*="Add content"]',
+    # --- input[type=file] ベース ---
+    'input[type="file"]',
+    # --- data-testid ベース ---
     'button[data-testid*="attach"]',
     'button[data-testid*="upload"]',
     'button[data-testid*="file"]',
+    # --- fieldset 内ボタン (構造ベース) ---
+    'fieldset button',
 ]
 
 # チャット入力欄
@@ -107,16 +118,21 @@ SEND_BUTTON_SELECTORS = [
 ]
 
 # 応答本文: Claude の返答テキストが入る要素
+# ユーザー発話を拾わないよう、アシスタント応答専用のマーカーを優先
 RESPONSE_TEXT_SELECTORS = [
-    "[data-is-streaming]",
+    # Claude 応答本文のコンテナ (最優先・厳密)
+    "div.font-claude-response",
+    "[data-is-streaming='false'] div.font-claude-response",
+    "[data-is-streaming='true'] div.font-claude-response",
+    # data-is-streaming 属性を持つ要素 (応答中/完了時に付与)
+    "div[data-is-streaming]",
+    # font-claude で始まるクラス
+    "[class*='font-claude-response']",
+    "[class*='font-claude-message']",
+    # 旧来の候補 (フォールバック)
     "[class*='font-claude']",
-    "[class*='assistant-']",
-    "[class*='response-']",
-    "[class*='message-content']",
     "[data-testid*='bot-message']",
-    "[data-testid*='message-content']",
     "[data-testid*='assistant']",
-    "[data-testid*='response']",
 ]
 
 # ストリーミング中インジケータ (これが消えたら応答完了)
@@ -298,36 +314,45 @@ def save_result(text: str, output_path: Path | None = None) -> Path:
 # =====================================================================
 
 async def wait_for_login(page) -> None:
-    """ログイン済みか確認し、未ログインなら手動ログインを待機する。"""
-    log.info("[Login] ログイン状態を確認中...")
+    """Claude の手動ログイン完了を URL ベースで待機する。"""
+    log.info("[Login] 手動ログイン確認を開始します")
 
-    # 短いタイムアウトで各セレクタを試す
-    for selector in LOGIN_CHECK_SELECTORS:
-        try:
-            await page.wait_for_selector(selector, timeout=8_000)
-            log.info("[Login] ログイン済み (成功セレクタ: %s)", selector)
-            return
-        except Exception:
-            log.debug("[Login] セレクタ不一致: %s", selector)
-            continue
+    current_url = page.url
+    log.info("[Login] 現在URL: %s", current_url)
 
-    # 未ログイン
+    if "login" not in current_url:
+        log.info("[Login] 既にログイン済みです")
+        return
+
     log.info("=" * 55)
     log.info("  *** 手動ログインが必要です ***")
-    log.info("  ブラウザ画面で Claude にログインしてください")
+    log.info("  開いたブラウザで Claude にログインしてください")
+    log.info("  ログイン完了後、自動で次へ進みます")
     log.info("  制限時間: %d 秒", LOGIN_TIMEOUT_MS // 1000)
     log.info("=" * 55)
 
-    for selector in LOGIN_CHECK_SELECTORS:
-        try:
-            await page.wait_for_selector(selector, timeout=LOGIN_TIMEOUT_MS)
-            log.info("[Login] ログイン完了 (成功セレクタ: %s)", selector)
-            return
-        except Exception:
-            log.debug("[Login] 待機タイムアウト: %s", selector)
-            continue
+    waited = 0
+    interval_ms = 1000
 
-    debug = await collect_debug_info(page, "login", LOGIN_CHECK_SELECTORS)
+    while waited < LOGIN_TIMEOUT_MS:
+        await page.wait_for_timeout(interval_ms)
+        waited += interval_ms
+
+        current_url = page.url
+
+        if waited % 10000 == 0:
+            log.info("[Login] 待機中... %d 秒経過 / URL=%s", waited // 1000, current_url)
+
+        if "login" not in current_url:
+            log.info("[Login] ログイン完了を検知: %s", current_url)
+
+            await page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=30_000)
+            await page.wait_for_timeout(3000)
+
+            log.info("[Login] Claude 画面へ復帰しました: %s", page.url)
+            return
+
+    debug = await collect_debug_info(page, "login", ["URL-based login wait"])
     write_error_log(f"ログインタイムアウト\n{debug}")
     raise TimeoutError("ログインがタイムアウトしました。ブラウザで手動ログイン後、再実行してください。")
 
@@ -344,33 +369,92 @@ async def upload_pdf(page, pdf_path: Path) -> None:
     uploaded = False
     tried: list[str] = []
 
-    # --- 方法 1: input[type=file] を直接操作 (最も安定) ---
-    method_name = "input[type='file'] 直接操作"
+    # --- 方法 1: ID 指定で input[type=file] に直接 set_files (最も安定) ---
+    file_input_id = "chat-input-file-upload-onpage"
+    method_name = f"#{file_input_id} (set_input_files)"
     tried.append(method_name)
     log.info("[Upload] 方法1 試行: %s", method_name)
     try:
-        file_inputs = page.locator('input[type="file"]')
-        count = await file_inputs.count()
-        log.debug("[Upload] input[type=file] 要素数: %d", count)
-        if count > 0:
-            for i in range(count):
-                input_el = file_inputs.nth(i)
-                accept_attr = await input_el.get_attribute("accept") or ""
-                if "pdf" in accept_attr.lower() or accept_attr == "" or "*" in accept_attr:
-                    await input_el.set_input_files(str(pdf_path))
-                    uploaded = True
-                    log.info("[Upload] 成功 (方法1: input#%d, accept='%s')", i, accept_attr)
-                    break
-            if not uploaded and count > 0:
-                await file_inputs.first.set_input_files(str(pdf_path))
-                uploaded = True
-                log.info("[Upload] 成功 (方法1: input first, フォールバック)")
+        input_el = page.locator(f"#{file_input_id}")
+        if await input_el.count() > 0:
+            await input_el.set_input_files(str(pdf_path))
+            uploaded = True
+            log.info("[Upload] 成功 (方法1: #%s)", file_input_id)
     except Exception as e:
-        log.debug("[Upload] 方法1 失敗: %s", e)
+        log.info("[Upload] 方法1 失敗: %s", e)
 
-    # --- 方法 2: 添付ボタンクリック + file_chooser イベント ---
+    # --- 方法 2: 汎用 input[type=file] を全探索して set_files ---
     if not uploaded:
-        log.info("[Upload] 方法2 試行: 添付ボタン + file_chooser")
+        method_name = "input[type='file'] 全探索"
+        tried.append(method_name)
+        log.info("[Upload] 方法2 試行: %s", method_name)
+        try:
+            file_inputs = page.locator('input[type="file"]')
+            count = await file_inputs.count()
+            log.info("[Upload] input[type=file] 要素数: %d", count)
+            for i in range(count):
+                try:
+                    await file_inputs.nth(i).set_input_files(str(pdf_path))
+                    uploaded = True
+                    log.info("[Upload] 成功 (方法2: input[type=file] #%d)", i)
+                    break
+                except Exception as e2:
+                    log.debug("[Upload] input#%d 失敗: %s", i, e2)
+        except Exception as e:
+            log.info("[Upload] 方法2 失敗: %s", e)
+
+    # --- 方法 2.5: +ボタンをクリックしてメニュー展開 → input 再探索 ---
+    if not uploaded:
+        method_name = "+ ボタンクリック → input 再探索"
+        tried.append(method_name)
+        log.info("[Upload] 方法2.5 試行: %s", method_name)
+        try:
+            plus_btn = page.locator(
+                'button[aria-label*="ファイルやコネクタ"], '
+                'button[aria-label*="追加"], '
+                'button[aria-label*="Attach"], '
+                'button[aria-label*="Add"]'
+            ).first
+            await plus_btn.click(timeout=3_000)
+            log.info("[Upload] + ボタンクリック成功。メニュー展開待機中...")
+            await page.wait_for_timeout(1_500)
+            # メニュー展開後に input[type=file] が現れるケース
+            file_inputs = page.locator('input[type="file"]')
+            count = await file_inputs.count()
+            log.info("[Upload] +クリック後 input[type=file] 要素数: %d", count)
+            for i in range(count):
+                try:
+                    await file_inputs.nth(i).set_input_files(str(pdf_path))
+                    uploaded = True
+                    log.info("[Upload] 成功 (方法2.5: +クリック後 input#%d)", i)
+                    break
+                except Exception as e2:
+                    log.debug("[Upload] 方法2.5 input#%d 失敗: %s", i, e2)
+            # メニュー項目から file_chooser が開くケース
+            if not uploaded:
+                menu_item_selectors = [
+                    '[role="menuitem"]:has-text("アップロード")',
+                    '[role="menuitem"]:has-text("ファイル")',
+                    '[role="menuitem"]:has-text("Upload")',
+                    '[role="menuitem"]:has-text("File")',
+                ]
+                for sel in menu_item_selectors:
+                    try:
+                        async with page.expect_file_chooser(timeout=3_000) as fc_info:
+                            await page.locator(sel).first.click(timeout=2_000)
+                        fc = await fc_info.value
+                        await fc.set_files(str(pdf_path))
+                        uploaded = True
+                        log.info("[Upload] 成功 (方法2.5: メニュー項目 %s)", sel)
+                        break
+                    except Exception as e3:
+                        log.debug("[Upload] 方法2.5 メニュー項目 %s 失敗: %s", sel, e3)
+        except Exception as e:
+            log.info("[Upload] 方法2.5 失敗: %s", e)
+
+    # --- 方法 3: 添付ボタンクリック + file_chooser イベント ---
+    if not uploaded:
+        log.info("[Upload] 方法3 試行: 添付ボタン + file_chooser")
         for selector in ATTACH_BUTTON_SELECTORS:
             tried.append(f"file_chooser + {selector}")
             try:
@@ -379,15 +463,15 @@ async def upload_pdf(page, pdf_path: Path) -> None:
                 file_chooser = await fc_info.value
                 await file_chooser.set_files(str(pdf_path))
                 uploaded = True
-                log.info("[Upload] 成功 (方法2: %s)", selector)
+                log.info("[Upload] 成功 (方法3: %s)", selector)
                 break
             except Exception as e:
-                log.debug("[Upload] 方法2 失敗 (%s): %s", selector, e)
+                log.debug("[Upload] 方法3 失敗 (%s): %s", selector, e)
                 continue
 
-    # --- 方法 3: ページ上のボタンを順に探索 (最終手段) ---
+    # --- 方法 4: ページ上のボタンを順に探索 (最終手段) ---
     if not uploaded:
-        log.info("[Upload] 方法3 試行: ボタン総当たり探索")
+        log.info("[Upload] 方法4 試行: ボタン総当たり探索")
         tried.append("ボタン総当たり探索")
         try:
             buttons = page.locator("button")
@@ -399,17 +483,34 @@ async def upload_pdf(page, pdf_path: Path) -> None:
                     file_chooser = await fc_info.value
                     await file_chooser.set_files(str(pdf_path))
                     uploaded = True
-                    log.info("[Upload] 成功 (方法3: button#%d)", i)
+                    log.info("[Upload] 成功 (方法4: button#%d)", i)
                     break
                 except Exception:
                     continue
         except Exception as e:
-            log.debug("[Upload] 方法3 失敗: %s", e)
+            log.debug("[Upload] 方法4 失敗: %s", e)
 
     # --- 全方法失敗 ---
     if not uploaded:
+        # 失敗時にDOMの主要要素の有無をログに残す
+        diag_lines = []
+        for sel, label in [
+            ('#chat-input-file-upload-onpage', 'file input (ID)'),
+            ('input[type="file"]', 'input[type=file]'),
+            ('button[aria-label*="ファイル"]', 'ファイルボタン'),
+            ('button[aria-label*="Attach"]', 'Attach button'),
+            ('fieldset button', 'fieldset内button'),
+        ]:
+            try:
+                cnt = await page.locator(sel).count()
+                diag_lines.append(f"  {label} ({sel}): {cnt}個")
+            except Exception:
+                diag_lines.append(f"  {label} ({sel}): 検出不可")
+        diag_text = "主要要素の検出結果:\n" + "\n".join(diag_lines)
+        log.error("[Upload] %s", diag_text)
+
         debug = await collect_debug_info(page, "upload", tried)
-        write_error_log(f"PDF アップロード失敗\n{debug}")
+        write_error_log(f"PDF アップロード失敗\n{diag_text}\n{debug}")
         raise RuntimeError(
             "PDF のアップロードに失敗しました。\n"
             "全てのセレクタ候補で失敗。詳細は output/error.log を確認してください。"
@@ -509,16 +610,18 @@ async def _try_extract_response(page) -> tuple[str, str]:
         except Exception:
             continue
 
-    # 方法2: main 配下の最後のテキストブロック群 (フォールバック)
+    # 方法2: font-claude-response 配下の p/ul/ol/pre を拾う (厳密フォールバック)
+    # ユーザー発話 (div.ProseMirror) は含めない
     try:
-        containers = page.locator("main, [role='main'], #__next")
-        if await containers.count() > 0:
-            paragraphs = containers.first.locator("div > p, div > ul, div > ol, div > pre")
+        resp_containers = page.locator("div.font-claude-response")
+        c_count = await resp_containers.count()
+        if c_count > 0:
+            last_resp = resp_containers.last
+            paragraphs = last_resp.locator("p, ul, ol, pre")
             p_count = await paragraphs.count()
             if p_count > 0:
                 texts = []
-                start_idx = max(0, p_count - 30)
-                for i in range(start_idx, p_count):
+                for i in range(p_count):
                     try:
                         t = await paragraphs.nth(i).inner_text(timeout=1_000)
                         if t and t.strip():
@@ -526,7 +629,7 @@ async def _try_extract_response(page) -> tuple[str, str]:
                     except Exception:
                         continue
                 if texts:
-                    return "\n".join(texts), "main>div>p (フォールバック)"
+                    return "\n".join(texts), "font-claude-response > p/ul/ol/pre"
     except Exception:
         pass
 
@@ -615,11 +718,8 @@ async def run(pdf_path: Path, prompt: str, output_path: Path | None = None) -> N
     log.info("=" * 60)
     log.info("PDF        : %s", pdf_path)
     log.info("プロンプト : %s", prompt)
-    log.info("ブラウザDB : %s", USER_DATA_DIR)
     log.info("出力先     : %s", OUTPUT_DIR)
     log.info("")
-
-    USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # --- Playwright import ---
     try:
@@ -628,24 +728,43 @@ async def run(pdf_path: Path, prompt: str, output_path: Path | None = None) -> N
         msg = (
             "Playwright がインストールされていません。\n"
             "以下を実行してください:\n"
-            "  pip install playwright\n"
-            "  playwright install chromium"
+            "  pip install playwright"
         )
         log.error(msg)
         write_error_log(msg)
         sys.exit(1)
 
-    async with async_playwright() as pw:
-        log.info("Chromium を起動中...")
-        context = await pw.chromium.launch_persistent_context(
-            user_data_dir=str(USER_DATA_DIR),
-            headless=False,
-            viewport={"width": 1280, "height": 900},
-            locale="ja-JP",
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+    CDP_ENDPOINT = "http://127.0.0.1:9222"
 
+    async with async_playwright() as pw:
+        log.info("既存の Chrome (CDP: 9222) に接続中...")
+        try:
+            browser = await pw.chromium.connect_over_cdp(CDP_ENDPOINT)
+        except Exception as e:
+            msg = (
+                f"CDP 接続に失敗しました ({CDP_ENDPOINT})。\n"
+                f"以下を確認してください:\n"
+                f"  1. Chrome が --remote-debugging-port=9222 付きで起動しているか\n"
+                f"     起動例: open -na 'Google Chrome' --args --remote-debugging-port=9222\n"
+                f"  2. Chrome 上で Claude にログイン済みか\n"
+                f"詳細: {e}"
+            )
+            log.error(msg)
+            write_error_log(msg, exc=e)
+            sys.exit(1)
+
+        if not browser.contexts:
+            msg = (
+                "CDP 接続先の Chrome に context がありません。\n"
+                "Chrome が正しく起動しているか確認してください。"
+            )
+            log.error(msg)
+            write_error_log(msg)
+            sys.exit(1)
+
+        context = browser.contexts[0]
         page = context.pages[0] if context.pages else await context.new_page()
+        log.info("既存 Chrome への接続に成功 (ページ数: %d)", len(context.pages))
 
         try:
             # Step 1: Claude.ai に遷移
@@ -698,8 +817,12 @@ async def run(pdf_path: Path, prompt: str, output_path: Path | None = None) -> N
             await save_screenshot(page, "error")
             raise
         finally:
-            log.info("ブラウザを閉じています...")
-            await context.close()
+            # CDP 接続を切断する (既存 Chrome 自体は閉じない)
+            log.info("CDP 接続を切断しています (Chrome は閉じません)...")
+            try:
+                await browser.close()
+            except Exception:
+                pass
             log.info("終了")
 
 
