@@ -78,6 +78,8 @@ LOGIN_CHECK_SELECTORS = [
 # 添付ボタン: ファイルアップロード用ボタン
 # Claude.ai の UI 変更時はここを更新する
 ATTACH_BUTTON_SELECTORS = [
+    # --- 現 UI 最優先 (2026-04 確認) ---
+    'button[aria-label*="ファイルやコネクタなどを追加"]',
     # --- ID ベース (最も安定) ---
     '#chat-input-file-upload-onpage',
     # --- aria-label ベース (日本語 UI) ---
@@ -388,13 +390,16 @@ async def upload_pdf(page, pdf_path: Path) -> None:
         # 主要要素の検出数 (アップロード UI の有無)
         id_count = await page.locator("#chat-input-file-upload-onpage").count()
         file_input_count = await page.locator('input[type="file"]').count()
+        add_content_count = await page.locator(
+            'button[aria-label*="ファイルやコネクタなどを追加"]'
+        ).count()
         plus_count = await page.locator(
             'button[aria-label*="追加"], button[aria-label*="ファイル"]'
         ).count()
         log.info(
             "[Upload] 主要要素: #chat-input-file-upload-onpage=%d, "
-            "input[type=file]=%d, +/ファイルボタン=%d",
-            id_count, file_input_count, plus_count,
+            "input[type=file]=%d, ファイルやコネクタなどを追加=%d, +/ファイルボタン=%d",
+            id_count, file_input_count, add_content_count, plus_count,
         )
     except Exception as e:
         log.warning("[Upload] 事前診断に失敗: %s", e)
@@ -403,6 +408,9 @@ async def upload_pdf(page, pdf_path: Path) -> None:
     tried: list[str] = []
 
     # --- 方法 1: ID 指定で input[type=file] に直接 set_files (最も安定) ---
+    # 現 UI (2026-04) では #chat-input-file-upload-onpage が hidden で存在する。
+    # set_input_files は visible でなくても動作するため、可視性チェックは行わず
+    # 「存在すれば試す」方針で進める。
     file_input_id = "chat-input-file-upload-onpage"
     method_name = f"#{file_input_id} (set_input_files)"
     tried.append(method_name)
@@ -410,6 +418,7 @@ async def upload_pdf(page, pdf_path: Path) -> None:
     try:
         input_el = page.locator(f"#{file_input_id}")
         if await input_el.count() > 0:
+            # hidden でも set_input_files は動作する
             await input_el.set_input_files(str(pdf_path))
             uploaded = True
             log.info("[Upload] 成功 (方法1: #%s)", file_input_id)
