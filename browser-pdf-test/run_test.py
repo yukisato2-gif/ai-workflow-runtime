@@ -822,6 +822,16 @@ async def run(pdf_path: Path, prompt: str, output_path: Path | None = None) -> N
             await page.wait_for_timeout(2_000)
 
             # Step 4: PDF アップロード
+            # アップロード前に入力 UI (ProseMirror) の描画完了を待つ
+            log.info("[Step 4/6] チャット入力 UI 描画待機中...")
+            try:
+                await page.wait_for_selector(
+                    "div.ProseMirror[contenteditable='true']",
+                    timeout=10_000,
+                )
+                log.info("[Step 4/6] 入力 UI 描画完了")
+            except Exception as e:
+                log.warning("[Step 4/6] 入力 UI 待機タイムアウト: %s (続行)", e)
             log.info("[Step 4/6] PDF アップロード...")
             await upload_pdf(page, pdf_path)
 
