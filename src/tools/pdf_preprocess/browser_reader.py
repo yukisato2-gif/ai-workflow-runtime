@@ -14,6 +14,7 @@ browser-pdf-test/ 側のコードもコピーしていない。
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -450,19 +451,39 @@ async def extract_text_from_pdf_via_chrome(pdf_path: str) -> str:
     if not Path(pdf_abs).exists():
         raise WorkflowError(f"PDF が見つかりません: {pdf_abs}")
 
-    file_url = f"file://{pdf_abs}"
+    # --- CloudStorage / GoogleDrive 配下は file:// で直接開けないため ---
+    # ローカル一時ディレクトリにコピーしてから開く
+    tmp_dir = Path("/tmp/pdf_work")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_dir / Path(pdf_abs).name
+    shutil.copy2(pdf_abs, tmp_path)
+    logger.info("[PDF] copy to tmp: %s -> %s", pdf_abs, tmp_path)
+
+    file_url = f"file://{tmp_path}"
     logger.info("[PDF] open: path=%s", pdf_abs)
+    logger.info("[PDF] open tmp file: %s", file_url)
 
     async with async_playwright() as pw:
         try:
             browser = await pw.chromium.connect_over_cdp(CDP_ENDPOINT)
         except Exception as e:
+            # tmp ファイルの清掃 (CDP 接続失敗時にも残さない)
+            try:
+                tmp_path.unlink(missing_ok=True)
+                logger.info("[PDF] cleanup tmp: %s", tmp_path)
+            except Exception:
+                pass
             raise WorkflowError(
                 f"CDP 接続失敗 ({CDP_ENDPOINT}): {e}\n"
                 f"Chrome を --remote-debugging-port=9222 で起動してください。"
             ) from e
 
         if not browser.contexts:
+            try:
+                tmp_path.unlink(missing_ok=True)
+                logger.info("[PDF] cleanup tmp: %s", tmp_path)
+            except Exception:
+                pass
             raise WorkflowError("CDP 接続先 Chrome に context がありません")
 
         context = browser.contexts[0]
@@ -490,6 +511,12 @@ async def extract_text_from_pdf_via_chrome(pdf_path: str) -> str:
                 await browser.close()
             except Exception:
                 pass
+            # tmp ファイル削除
+            try:
+                tmp_path.unlink(missing_ok=True)
+                logger.info("[PDF] cleanup tmp: %s", tmp_path)
+            except Exception as e:
+                logger.debug("[PDF] tmp cleanup 失敗: %s", e)
 
 
 async def _send_text_to_claude_and_get_response(prompt_text: str) -> str:
