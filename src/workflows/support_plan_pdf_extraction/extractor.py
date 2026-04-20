@@ -24,6 +24,23 @@ PROMPT_FILES: dict[str, str] = {
     "monitoring": "monitoring.md",
 }
 
+# JSON 強制指示ブロック
+# プロンプトが自然文応答を返すのを防ぐため、load_prompt() の末尾に必ず付加する。
+JSON_ONLY_SUFFIX = """
+
+---
+
+【返答形式 (厳守)】
+出力は必ず JSON オブジェクトのみとしてください。
+以下を一切含めないでください:
+- 説明文・前置き・補足
+- 箇条書き・見出し
+- Markdown 装飾
+- ```json ... ``` のコードフェンス
+先頭は { 、末尾は } にしてください。
+不明な項目は空文字 "" にしてください。
+"""
+
 
 def _resolve_prompts_dir() -> Path:
     """cowork-assets のプロンプトディレクトリを解決する。"""
@@ -77,13 +94,18 @@ def load_prompt(document_type: str) -> str:
             f"Set COWORK_ASSETS_DIR or SUPPORT_PLAN_PROMPTS_DIR environment variable."
         )
 
-    return prompt_path.read_text(encoding="utf-8")
+    # cowork-assets のプロンプト本体に加え、JSON 強制指示を末尾に必ず付加する
+    return prompt_path.read_text(encoding="utf-8") + JSON_ONLY_SUFFIX
 
 
 def parse_claude_response(response_text: str) -> dict:
     """Claude の応答テキストから JSON を抽出・パースする。
 
-    応答がコードブロック (```json ... ```) で囲まれていても除去する。
+    以下のサルベージを順に試みる:
+      1. そのまま json.loads
+      2. ```json ... ``` や ``` ... ``` コードフェンス除去後に json.loads
+      3. 自然文が混入している場合、最初の "{" から最後の "}" までを
+         抽出して json.loads (前置き・後置き文を除去)
 
     Args:
         response_text: Claude 応答テキスト。
@@ -92,20 +114,46 @@ def parse_claude_response(response_text: str) -> dict:
         パース済み dict。
 
     Raises:
-        WorkflowError: JSON パースに失敗した場合。
+        WorkflowError: 全手段で JSON パースに失敗した場合。
     """
     text = response_text.strip()
-    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
-    if match:
-        text = match.group(1).strip()
-        logger.debug("Extracted JSON from code block")
 
+    # 試行 1: そのまま
     try:
         return json.loads(text)
-    except json.JSONDecodeError as e:
-        logger.error("JSON parse failed: %s", e)
-        logger.error("Response first 200 chars: %s", text[:200])
-        raise WorkflowError(
-            f"Claude response is not valid JSON: {e}. "
-            f"First 100 chars: {text[:100]}"
-        ) from e
+    except json.JSONDecodeError:
+        pass
+
+    # 試行 2: コードフェンス除去
+    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+    if fence_match:
+        fenced = fence_match.group(1).strip()
+        logger.debug("コードフェンスから JSON を抽出")
+        try:
+            return json.loads(fenced)
+        except json.JSONDecodeError:
+            text = fenced  # フェンス除去後のテキストで後段サルベージへ
+
+    # 試行 3: 最初の { から最後の } を抽出 (自然文サルベージ)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start : end + 1].strip()
+        logger.debug("自然文サルベージで JSON 抽出試行 (len=%d)", len(candidate))
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as e:
+            logger.error("サルベージ後も JSON パース失敗: %s", e)
+            logger.error("サルベージ先頭200文字: %s", candidate[:200])
+            raise WorkflowError(
+                f"Claude response is not valid JSON after salvage: {e}. "
+                f"First 100 chars: {candidate[:100]}"
+            ) from e
+
+    # 全滅
+    logger.error("JSON parse failed: { ... } パターンが見つかりません")
+    logger.error("Response first 200 chars: %s", text[:200])
+    raise WorkflowError(
+        f"Claude response is not valid JSON. "
+        f"First 100 chars: {text[:100]}"
+    )
