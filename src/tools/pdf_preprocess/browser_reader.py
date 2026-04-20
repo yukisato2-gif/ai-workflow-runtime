@@ -329,55 +329,102 @@ STABLE_THRESHOLD = 3
 
 
 async def _extract_text_from_pdf_page(page) -> str:
-    """PDF 表示ページからテキストを抽出する。
+    """PDF 表示ページからテキストを抽出する (強化版)。
 
     優先順位:
       1. document.body.innerText
-      2. embed / iframe 内の innerText
-      3. スクロールしつつ全文を収集
+      2. embed / iframe の存在確認・コンテンツ抽出
+      3. スクロールしながら全文取得 (body.scrollHeight が変わらなくなるまで)
+      4. それでも空なら WorkflowError
     """
-    import asyncio
-
     # 1. body.innerText
     try:
         text = await page.evaluate("() => document.body.innerText")
-        if text and len(text.strip()) > 50:
+        if text and len(text.strip()) >= 50:
+            logger.info("[PDF] text length=%d (method=body.innerText)",
+                        len(text.strip()))
             return text.strip()
+        else:
+            logger.info("[PDF] body.innerText が空/不十分 (len=%d) → embed 確認へ",
+                        len(text.strip()) if text else 0)
     except Exception as e:
         logger.debug("[PDF] body.innerText 取得失敗: %s", e)
 
-    # 2. embed / iframe
+    # 2. embed / iframe 存在確認・コンテンツ抽出
     try:
-        text = await page.evaluate(
-            """() => {
-                const embed = document.querySelector('embed');
-                if (embed && embed.contentDocument) {
-                    return embed.contentDocument.body.innerText;
-                }
-                const iframe = document.querySelector('iframe');
-                if (iframe && iframe.contentDocument) {
-                    return iframe.contentDocument.body.innerText;
-                }
-                return '';
-            }"""
+        has_embed = await page.evaluate(
+            "() => !!document.querySelector('embed')"
         )
-        if text and len(text.strip()) > 50:
-            return text.strip()
+        has_iframe = await page.evaluate(
+            "() => !!document.querySelector('iframe')"
+        )
+        logger.info("[PDF] embed存在=%s, iframe存在=%s", has_embed, has_iframe)
+
+        if has_embed or has_iframe:
+            logger.info("[PDF] fallback used: embed/iframe 内テキスト抽出")
+            text = await page.evaluate(
+                """() => {
+                    const embed = document.querySelector('embed');
+                    if (embed && embed.contentDocument) {
+                        return embed.contentDocument.body.innerText;
+                    }
+                    const iframe = document.querySelector('iframe');
+                    if (iframe && iframe.contentDocument) {
+                        return iframe.contentDocument.body.innerText;
+                    }
+                    return '';
+                }"""
+            )
+            if text and len(text.strip()) >= 50:
+                logger.info("[PDF] text length=%d (method=embed/iframe)",
+                            len(text.strip()))
+                return text.strip()
     except Exception as e:
         logger.debug("[PDF] embed/iframe 抽出失敗: %s", e)
 
-    # 3. スクロールして body.innerText を再取得
+    # 3. スクロールしながら全文収集 (scrollHeight が安定するまで)
+    logger.info("[PDF] fallback used: scroll extraction")
     try:
-        for _ in range(5):
-            await page.evaluate("() => window.scrollBy(0, window.innerHeight)")
-            await asyncio.sleep(0.5)
-        text = await page.evaluate("() => document.body.innerText")
-        if text:
+        scroll_script = """
+            async () => {
+                let lastHeight = 0;
+                let lastText = '';
+                let stable = 0;
+                for (let i = 0; i < 50; i++) {
+                    window.scrollBy(0, window.innerHeight);
+                    await new Promise(r => setTimeout(r, 500));
+                    const h = document.body.scrollHeight;
+                    const t = document.body.innerText;
+                    if (h === lastHeight && t === lastText) {
+                        stable++;
+                        if (stable >= 2) break;
+                    } else {
+                        stable = 0;
+                    }
+                    lastHeight = h;
+                    lastText = t;
+                }
+                return document.body.innerText;
+            }
+        """
+        text = await page.evaluate(scroll_script)
+        if text and len(text.strip()) >= 50:
+            logger.info("[PDF] text length=%d (method=scroll)",
+                        len(text.strip()))
             return text.strip()
+        else:
+            logger.warning(
+                "[PDF] スクロール抽出後も空/不十分: len=%d",
+                len(text.strip()) if text else 0,
+            )
     except Exception as e:
         logger.debug("[PDF] スクロール後抽出失敗: %s", e)
 
-    return ""
+    # 4. 全手段で失敗 → 明示的にエラー
+    logger.error("[PDF] extract failed: empty text")
+    raise WorkflowError(
+        "PDFテキスト抽出失敗: 空または不十分 (body.innerText / embed / スクロール 全滅)"
+    )
 
 
 async def extract_text_from_pdf_via_chrome(pdf_path: str) -> str:
