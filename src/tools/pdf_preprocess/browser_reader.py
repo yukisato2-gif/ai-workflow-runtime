@@ -305,3 +305,319 @@ def extract_json_via_browser(pdf_path: str, prompt_template: str) -> dict:
             f"ブラウザ応答の JSON パースに失敗: {e}\n"
             f"応答先頭: {json_text[:100]}"
         ) from e
+
+
+# =====================================================================
+# 新方式: Chrome で PDF を開いてテキスト抽出 + Claude に送信
+# =====================================================================
+# PDF 添付方式 (upload_pdf) を排除し、以下の流れで処理する:
+#   1. CDP 接続済み Chrome に新タブを開く
+#   2. file:///... で PDF を開かせ Chrome の PDF ビューアで表示
+#   3. document.body.innerText / embed / iframe 経由でテキスト抽出
+#   4. 抽出テキストを Claude の既存チャット UI に貼り付けて送信
+#   5. 応答 JSON を取得
+#
+# Chrome は手動起動された CDP 9222 接続先を再利用する (新たな Chrome は起動しない)
+
+CDP_ENDPOINT = os.getenv("BROWSER_CDP_ENDPOINT", "http://127.0.0.1:9222")
+CLAUDE_URL = os.getenv("CLAUDE_URL", "https://claude.ai/new")
+PDF_OPEN_TIMEOUT_MS = int(os.getenv("PDF_OPEN_TIMEOUT_MS", "30000"))
+PDF_RENDER_WAIT_MS = int(os.getenv("PDF_RENDER_WAIT_MS", "3000"))
+CLAUDE_RESPONSE_TIMEOUT_MS = int(os.getenv("CLAUDE_RESPONSE_TIMEOUT_MS", "180000"))
+CLAUDE_POLL_INTERVAL_MS = 2000
+STABLE_THRESHOLD = 3
+
+
+async def _extract_text_from_pdf_page(page) -> str:
+    """PDF 表示ページからテキストを抽出する。
+
+    優先順位:
+      1. document.body.innerText
+      2. embed / iframe 内の innerText
+      3. スクロールしつつ全文を収集
+    """
+    import asyncio
+
+    # 1. body.innerText
+    try:
+        text = await page.evaluate("() => document.body.innerText")
+        if text and len(text.strip()) > 50:
+            return text.strip()
+    except Exception as e:
+        logger.debug("[PDF] body.innerText 取得失敗: %s", e)
+
+    # 2. embed / iframe
+    try:
+        text = await page.evaluate(
+            """() => {
+                const embed = document.querySelector('embed');
+                if (embed && embed.contentDocument) {
+                    return embed.contentDocument.body.innerText;
+                }
+                const iframe = document.querySelector('iframe');
+                if (iframe && iframe.contentDocument) {
+                    return iframe.contentDocument.body.innerText;
+                }
+                return '';
+            }"""
+        )
+        if text and len(text.strip()) > 50:
+            return text.strip()
+    except Exception as e:
+        logger.debug("[PDF] embed/iframe 抽出失敗: %s", e)
+
+    # 3. スクロールして body.innerText を再取得
+    try:
+        for _ in range(5):
+            await page.evaluate("() => window.scrollBy(0, window.innerHeight)")
+            await asyncio.sleep(0.5)
+        text = await page.evaluate("() => document.body.innerText")
+        if text:
+            return text.strip()
+    except Exception as e:
+        logger.debug("[PDF] スクロール後抽出失敗: %s", e)
+
+    return ""
+
+
+async def extract_text_from_pdf_via_chrome(pdf_path: str) -> str:
+    """CDP 接続済み Chrome で PDF を開いてテキストを抽出する。
+
+    Args:
+        pdf_path: PDF ファイルのローカル絶対パス。
+
+    Returns:
+        抽出テキスト。
+
+    Raises:
+        WorkflowError: 接続・抽出に失敗した場合。
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as e:
+        raise WorkflowError(
+            "playwright がインストールされていません。pip install playwright"
+        ) from e
+
+    pdf_abs = str(Path(pdf_path).resolve())
+    if not Path(pdf_abs).exists():
+        raise WorkflowError(f"PDF が見つかりません: {pdf_abs}")
+
+    file_url = f"file://{pdf_abs}"
+    logger.info("[PDF] open: path=%s", pdf_abs)
+
+    async with async_playwright() as pw:
+        try:
+            browser = await pw.chromium.connect_over_cdp(CDP_ENDPOINT)
+        except Exception as e:
+            raise WorkflowError(
+                f"CDP 接続失敗 ({CDP_ENDPOINT}): {e}\n"
+                f"Chrome を --remote-debugging-port=9222 で起動してください。"
+            ) from e
+
+        if not browser.contexts:
+            raise WorkflowError("CDP 接続先 Chrome に context がありません")
+
+        context = browser.contexts[0]
+        pdf_page = await context.new_page()
+        try:
+            await pdf_page.goto(file_url, timeout=PDF_OPEN_TIMEOUT_MS)
+            # PDF ビューアの描画待ち
+            await pdf_page.wait_for_timeout(PDF_RENDER_WAIT_MS)
+
+            text = await _extract_text_from_pdf_page(pdf_page)
+            if not text:
+                raise WorkflowError(
+                    f"PDF からテキストを抽出できませんでした: {pdf_abs}"
+                )
+
+            logger.info("[PDF] text length=%d", len(text))
+            logger.info("[PDF] extract success")
+            return text
+        finally:
+            try:
+                await pdf_page.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+
+async def _send_text_to_claude_and_get_response(prompt_text: str) -> str:
+    """Claude UI (CDP 接続 Chrome) にテキストを送信して応答を取得する。
+
+    既存の Claude タブを探し、なければ新規に /new を開く。
+    応答はテキスト安定化 (連続 STABLE_THRESHOLD 回同一) で完了判定。
+    """
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        try:
+            browser = await pw.chromium.connect_over_cdp(CDP_ENDPOINT)
+        except Exception as e:
+            raise WorkflowError(f"CDP 接続失敗 ({CDP_ENDPOINT}): {e}") from e
+
+        if not browser.contexts:
+            raise WorkflowError("CDP 接続先 Chrome に context がありません")
+
+        context = browser.contexts[0]
+
+        # ログインチェック: 既存ページの URL を確認
+        claude_page = None
+        for p in context.pages:
+            if "claude.ai" in p.url and "login" not in p.url:
+                claude_page = p
+                break
+
+        if claude_page is None:
+            # 既存 Claude ページなし → 新タブで /new
+            claude_page = await context.new_page()
+            await claude_page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=30_000)
+
+        if "login" in claude_page.url:
+            raise RuntimeError(
+                "Claude にログインされていません。ブラウザでログインしてください"
+            )
+
+        # /new でなければ /new へ
+        if "claude.ai/new" not in claude_page.url:
+            await claude_page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=30_000)
+
+        # 入力欄待機
+        await claude_page.wait_for_selector(
+            "div.ProseMirror[contenteditable='true']", timeout=10_000
+        )
+
+        # 入力
+        input_el = claude_page.locator("div.ProseMirror[contenteditable='true']").first
+        await input_el.click(timeout=5_000)
+        # 長文対応: clipboard 経由ではなく keyboard.type (確実)
+        await claude_page.keyboard.type(prompt_text, delay=0)
+        await claude_page.wait_for_timeout(500)
+
+        # 送信
+        try:
+            send_btn = claude_page.locator('button[aria-label*="送信"]').first
+            if await send_btn.count() > 0:
+                await send_btn.click(timeout=3_000)
+            else:
+                await claude_page.keyboard.press("Enter")
+        except Exception:
+            await claude_page.keyboard.press("Enter")
+
+        # 応答取得 (テキスト安定化判定)
+        await claude_page.wait_for_timeout(3_000)
+
+        response_selectors = [
+            "div.font-claude-response",
+            "[class*='font-claude-response']",
+            "[class*='font-claude']",
+        ]
+        streaming_selectors = [
+            'button[aria-label*="Stop"]',
+            'button[aria-label*="停止"]',
+            "[data-is-streaming='true']",
+        ]
+
+        prev_text = ""
+        stable = 0
+        max_polls = CLAUDE_RESPONSE_TIMEOUT_MS // CLAUDE_POLL_INTERVAL_MS
+
+        for _ in range(int(max_polls)):
+            cur_text = ""
+            for sel in response_selectors:
+                try:
+                    loc = claude_page.locator(sel)
+                    if await loc.count() > 0:
+                        cur_text = (await loc.last.inner_text(timeout=3_000)).strip()
+                        if cur_text:
+                            break
+                except Exception:
+                    continue
+
+            # ストリーミング中?
+            is_streaming = False
+            for sel in streaming_selectors:
+                try:
+                    el = claude_page.locator(sel)
+                    if await el.count() > 0 and await el.first.is_visible(timeout=1_000):
+                        is_streaming = True
+                        break
+                except Exception:
+                    continue
+
+            if is_streaming:
+                stable = 0
+            elif cur_text and cur_text == prev_text:
+                stable += 1
+                if stable >= STABLE_THRESHOLD:
+                    return cur_text
+            else:
+                stable = 0
+
+            prev_text = cur_text
+            await claude_page.wait_for_timeout(CLAUDE_POLL_INTERVAL_MS)
+
+        if prev_text:
+            logger.warning("[Claude] 応答タイムアウト。取得済みテキストを返します")
+            return prev_text
+
+        raise WorkflowError("Claude 応答を取得できませんでした")
+
+
+def _adapt_text_prompt(prompt_template: str, extracted_text: str) -> str:
+    """API 用プロンプトテンプレートに抽出テキストを埋め込む。
+
+    {ocr_text} プレースホルダがあればそこに挿入。
+    無ければ末尾に「【入力テキスト】」として追加。
+    """
+    if "{ocr_text}" in prompt_template:
+        return prompt_template.replace("{ocr_text}", extracted_text)
+    # プレースホルダが無い場合は末尾に付加
+    return f"{prompt_template.strip()}\n\n【入力テキスト】\n{extracted_text}"
+
+
+def extract_json_via_text(pdf_path: str, prompt_template: str) -> dict:
+    """新方式: PDF を Chrome で開いてテキスト抽出 → Claude UI に送信 → JSON 取得。
+
+    Args:
+        pdf_path: PDF ファイルのパス。
+        prompt_template: 既存プロンプト (assessment.md 等の Markdown 本文)。
+
+    Returns:
+        パース済み JSON dict。
+
+    Raises:
+        WorkflowError: 抽出または応答取得に失敗した場合。
+    """
+    import asyncio
+
+    logger.info("Claude ブラウザ方式 (テキスト抽出): %s", pdf_path)
+
+    # 1. Chrome で PDF を開いてテキスト抽出
+    extracted_text = asyncio.run(extract_text_from_pdf_via_chrome(pdf_path))
+
+    # 2. プロンプトに抽出テキストを埋め込み
+    full_prompt = _adapt_text_prompt(prompt_template, extracted_text)
+    logger.debug("送信プロンプト長: %d 文字", len(full_prompt))
+
+    # 3. Claude UI に送信して応答取得
+    response_text = asyncio.run(_send_text_to_claude_and_get_response(full_prompt))
+    logger.info("Claude 応答長: %d 文字", len(response_text))
+
+    # 4. JSON パース (既存ロジックと同様)
+    json_text = response_text.strip()
+    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", json_text, re.DOTALL)
+    if m:
+        json_text = m.group(1).strip()
+
+    try:
+        return json.loads(json_text)
+    except json.JSONDecodeError as e:
+        logger.error("JSON パース失敗: %s", e)
+        logger.error("応答先頭200文字: %s", json_text[:200])
+        raise WorkflowError(
+            f"Claude 応答の JSON パースに失敗: {e}\n応答先頭: {json_text[:100]}"
+        ) from e
