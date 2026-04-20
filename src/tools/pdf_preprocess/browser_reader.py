@@ -452,11 +452,23 @@ async def extract_text_from_pdf_via_chrome(pdf_path: str) -> str:
         raise WorkflowError(f"PDF が見つかりません: {pdf_abs}")
 
     # --- CloudStorage / GoogleDrive 配下は file:// で直接開けないため ---
-    # ローカル一時ディレクトリにコピーしてから開く
+    # ローカル一時ディレクトリにコピーしてから開く。
+    # Drive は仮想ファイルで copy2 だとタイムアウトするため、
+    # 1MB ずつのストリームコピーで Drive 側ダウンロードの遅延に耐える。
     tmp_dir = Path("/tmp/pdf_work")
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_dir / Path(pdf_abs).name
-    shutil.copy2(pdf_abs, tmp_path)
+    logger.info("[PDF] streaming copy start: %s -> %s", pdf_abs, tmp_path)
+    total_bytes = 0
+    chunk_size = 1024 * 1024  # 1MB
+    with open(pdf_abs, "rb") as src, open(tmp_path, "wb") as dst:
+        while True:
+            chunk = src.read(chunk_size)
+            if not chunk:
+                break
+            dst.write(chunk)
+            total_bytes += len(chunk)
+    logger.info("[PDF] streaming copy done: size=%d bytes", total_bytes)
     logger.info("[PDF] copy to tmp: %s -> %s", pdf_abs, tmp_path)
 
     file_url = f"file://{tmp_path}"
