@@ -369,6 +369,13 @@ async def upload_pdf(page, pdf_path: Path) -> None:
              pdf_path.name, pdf_path.stat().st_size)
 
     # --- 事前診断: アップロード UI を持つ画面にいるか確認 ---
+    # ログイン状態チェック: 未ログインなら即エラー
+    if "login" in page.url:
+        log.error("[Login] 未ログイン検出: URL=%s", page.url)
+        raise RuntimeError(
+            "Claude にログインされていません。ブラウザでログインしてください"
+        )
+
     try:
         cur_url = page.url
         cur_title = await page.title()
