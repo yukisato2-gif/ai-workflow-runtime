@@ -407,23 +407,47 @@ async def upload_pdf(page, pdf_path: Path) -> None:
     uploaded = False
     tried: list[str] = []
 
-    # --- 方法 1: ID 指定で input[type=file] に直接 set_files (最も安定) ---
-    # 現 UI (2026-04) では #chat-input-file-upload-onpage が hidden で存在する。
-    # set_input_files は visible でなくても動作するため、可視性チェックは行わず
-    # 「存在すれば試す」方針で進める。
-    file_input_id = "chat-input-file-upload-onpage"
-    method_name = f"#{file_input_id} (set_input_files)"
+    # --- 方法 1: add-content button + file_chooser (現 UI 最優先) ---
+    # 現 UI (2026-04) は「ファイルやコネクタなどを追加」ボタンをクリックして
+    # file chooser を開く方式が確実。hidden input への直接 set_input_files
+    # は UI 変更で動作しない場合があるため、ボタン経由を先に試す。
+    method_name = "add-content button + file chooser"
     tried.append(method_name)
-    log.info("[Upload] 方法1 試行: %s", method_name)
+    log.info("[Upload] 方法1: add-content button + file chooser")
     try:
-        input_el = page.locator(f"#{file_input_id}")
-        if await input_el.count() > 0:
-            # hidden でも set_input_files は動作する
-            await input_el.set_input_files(str(pdf_path))
+        button = page.locator(
+            'button[aria-label*="ファイルやコネクタなどを追加"]'
+        ).first
+        if await button.count() > 0:
+            async with page.expect_file_chooser(timeout=5_000) as fc_info:
+                await button.click(timeout=3_000)
+            fc = await fc_info.value
+            await fc.set_files(str(pdf_path))
             uploaded = True
-            log.info("[Upload] 成功 (方法1: #%s)", file_input_id)
+            log.info("[Upload] 成功 (方法1: add-content button + file chooser)")
+        else:
+            log.info("[Upload] 方法1 スキップ: add-content button が存在しない")
     except Exception as e:
         log.info("[Upload] 方法1 失敗: %s", e)
+
+    # --- 方法 2: ID 指定で input[type=file] に直接 set_files (フォールバック) ---
+    # #chat-input-file-upload-onpage が hidden で存在する場合、
+    # set_input_files は visible でなくても動作することがある。
+    # 方法1 が失敗した場合のフォールバックとして維持。
+    if not uploaded:
+        file_input_id = "chat-input-file-upload-onpage"
+        method_name = f"#{file_input_id} (set_input_files)"
+        tried.append(method_name)
+        log.info("[Upload] 方法2 試行: %s", method_name)
+        try:
+            input_el = page.locator(f"#{file_input_id}")
+            if await input_el.count() > 0:
+                # hidden でも set_input_files は動作する
+                await input_el.set_input_files(str(pdf_path))
+                uploaded = True
+                log.info("[Upload] 成功 (方法2: #%s)", file_input_id)
+        except Exception as e:
+            log.info("[Upload] 方法2 失敗: %s", e)
 
     # --- 方法 2: 汎用 input[type=file] を全探索して set_files ---
     if not uploaded:
