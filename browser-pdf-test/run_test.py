@@ -694,35 +694,81 @@ async def send_prompt(page, prompt: str) -> None:
     await page.wait_for_timeout(500)
 
     # --- 送信 ---
+    # 優先順位:
+    #   1) Enter キー送信を最優先で実行
+    #   2) UI 変化を待ち、入力欄が空になっていれば送信成功とみなす
+    #   3) 送信されていなければ送信ボタン fallback
+    #   4) それでも失敗なら既存の SEND_BUTTON_SELECTORS を総当たり
     sent = False
     send_method = ""
     tried_send: list[str] = []
 
-    # 方法A: 送信ボタンをクリック
-    for selector in SEND_BUTTON_SELECTORS:
-        tried_send.append(f"button: {selector}")
+    async def _input_is_empty() -> bool:
+        """入力欄が空 (= 送信された) か判定。"""
         try:
-            btn = page.locator(selector).first
-            if await btn.is_visible(timeout=2_000):
-                await btn.click(timeout=3_000)
-                sent = True
-                send_method = f"button: {selector}"
-                log.info("[Send] 送信成功 (ボタン: %s)", selector)
-                break
-        except Exception as e:
-            log.debug("[Send] 送信ボタン失敗 (%s): %s", selector, e)
-            continue
+            inner = await page.locator(used_selector).first.inner_text(timeout=2_000)
+        except Exception:
+            return False
+        return not inner or len(inner.strip()) == 0
 
-    # 方法B: Enter キー
-    if not sent:
-        tried_send.append("Enter キー")
-        try:
-            await page.keyboard.press("Enter")
+    # --- 方法1: Enter キー送信 (最優先) ---
+    tried_send.append("Enter キー (最優先)")
+    try:
+        log.info("[Send] Enter送信実行")
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(2000)
+        if await _input_is_empty():
             sent = True
             send_method = "Enter"
             log.info("[Send] 送信成功 (Enter キー)")
-        except Exception as e:
-            log.debug("[Send] Enter キー失敗: %s", e)
+    except Exception as e:
+        log.debug("[Send] Enter 送信失敗: %s", e)
+
+    # --- 方法2: ボタン送信フォールバック (DOM 変化なし時のみ) ---
+    # 依頼指定の配列候補
+    EXTRA_SEND_BUTTON_SELECTORS = [
+        'button:has-text("Send")',
+        'button:has-text("送信")',
+        'button[aria-label="Send message"]',
+        'button[data-testid="send-button"]',
+    ]
+    if not sent:
+        log.info("[Send] ボタン送信フォールバック実行")
+        for selector in EXTRA_SEND_BUTTON_SELECTORS:
+            tried_send.append(f"button: {selector}")
+            try:
+                btn = page.locator(selector).first
+                if await btn.count() > 0 and await btn.is_visible(timeout=2_000):
+                    await btn.click(timeout=3_000)
+                    await page.wait_for_timeout(1500)
+                    if await _input_is_empty():
+                        sent = True
+                        send_method = f"button: {selector}"
+                        log.info("[Send] 使用ボタンセレクタ: %s", selector)
+                        log.info("[Send] 送信成功 (ボタン: %s)", selector)
+                        break
+            except Exception as e:
+                log.debug("[Send] 送信ボタン失敗 (%s): %s", selector, e)
+                continue
+
+    # --- 方法3: 既存の SEND_BUTTON_SELECTORS 総当たり (最終フォールバック) ---
+    if not sent:
+        for selector in SEND_BUTTON_SELECTORS:
+            tried_send.append(f"button: {selector}")
+            try:
+                btn = page.locator(selector).first
+                if await btn.count() > 0 and await btn.is_visible(timeout=2_000):
+                    await btn.click(timeout=3_000)
+                    await page.wait_for_timeout(1500)
+                    if await _input_is_empty():
+                        sent = True
+                        send_method = f"button: {selector}"
+                        log.info("[Send] 使用ボタンセレクタ: %s", selector)
+                        log.info("[Send] 送信成功 (ボタン: %s)", selector)
+                        break
+            except Exception as e:
+                log.debug("[Send] 送信ボタン失敗 (%s): %s", selector, e)
+                continue
 
     if not sent:
         debug = await collect_debug_info(page, "send_submit", tried_send)
