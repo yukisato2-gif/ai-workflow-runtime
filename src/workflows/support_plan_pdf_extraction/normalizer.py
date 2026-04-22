@@ -82,14 +82,18 @@ def _normalize_date(value: Any) -> str:
 def _normalize_plan_period(value: Any) -> dict:
     """計画期間を {"start": "...", "end": "..."} に統一する。
 
-    Claude が start/end の代わりに start_date/end_date を返すケースもあるため、
-    dict 入力時は両方のキーを候補として受け付ける。
+    Claude が start/end の代わりに start_date/end_date や日本語キー
+    (開始/終了) を返すケースがあるため、dict 入力時は複数キー候補を受け付ける。
     """
     if isinstance(value, dict):
-        start_val = value.get("start") if value.get("start") not in (None, "") \
-                    else value.get("start_date")
-        end_val = value.get("end") if value.get("end") not in (None, "") \
-                  else value.get("end_date")
+        def _pick(*keys):
+            for k in keys:
+                if k in value and value[k] not in (None, ""):
+                    return value[k]
+            return None
+
+        start_val = _pick("start", "start_date", "開始", "開始日")
+        end_val = _pick("end", "end_date", "終了", "終了日")
         return {
             "start": _normalize_date(start_val),
             "end": _normalize_date(end_val),
@@ -181,14 +185,42 @@ def normalize(document_type: str, raw: dict) -> dict:
         result["home_name"] = _s(raw.get("home_name"))
 
     elif document_type == "plan_draft":
-        # Claude がプロンプト指定と違うキー名で返すケースを吸収
-        # (group_home_name, creation_month, service_manager 等)
-        result["home_name"] = _s(_first(raw, "home_name", "group_home_name"))
-        result["created_date"] = _normalize_date(
-            _first(raw, "created_date", "creation_month", "creation_date")
+        # Claude がプロンプト指定と違うキー名 (英語別名 / 日本語キー) で返す
+        # ケースを吸収。主要項目が全て空なら review_required を強制する。
+        result["home_name"] = _s(_first(
+            raw,
+            "home_name", "group_home_name",
+            "グループホーム名", "ホーム名", "事業所名",
+        ))
+        result["created_date"] = _normalize_date(_first(
+            raw,
+            "created_date", "creation_month", "creation_date",
+            "作成月", "作成日",
+        ))
+        # 計画期間: 英語キー "plan_period" / 日本語キー "計画期間" 両対応
+        result["plan_period"] = _normalize_plan_period(
+            _first(raw, "plan_period", "計画期間")
         )
-        result["plan_period"] = _normalize_plan_period(raw.get("plan_period"))
-        result["author"] = _s(_first(raw, "author", "service_manager", "creator"))
+        result["author"] = _s(_first(
+            raw,
+            "author", "service_manager", "creator",
+            "サービス管理責任者", "作成者", "記載者",
+        ))
+
+        # 主要項目が全て空なら review_required=true に強制
+        # (Claude がキー名不一致の別形式で返し、値を拾えなかった場合の救済)
+        if (
+            not result["home_name"]
+            and not result["created_date"]
+            and not result["plan_period"].get("start")
+            and not result["plan_period"].get("end")
+            and not result["author"]
+        ):
+            result["review_required"] = True
+            if not result.get("review_comment"):
+                result["review_comment"] = (
+                    "主要項目が全て空 (Claude キー名不一致の可能性)"
+                )
 
     elif document_type == "meeting_record":
         result["meeting_date"] = _normalize_date(raw.get("meeting_date"))
