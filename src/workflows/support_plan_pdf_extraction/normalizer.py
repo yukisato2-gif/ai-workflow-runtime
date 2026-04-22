@@ -69,16 +69,30 @@ def _normalize_date(value: Any) -> str:
         y, mo = m.groups()
         return f"{int(y):04d}-{int(mo):02d}"
 
+    # YYYY年M月 (年月のみ、日なし)
+    m = re.fullmatch(r"(\d{4})年(\d{1,2})月", s)
+    if m:
+        y, mo = m.groups()
+        return f"{int(y):04d}-{int(mo):02d}"
+
     # 変換不能: 元値を返す (呼び出し側で review_required 判定)
     return s
 
 
 def _normalize_plan_period(value: Any) -> dict:
-    """計画期間を {"start": "...", "end": "..."} に統一する。"""
+    """計画期間を {"start": "...", "end": "..."} に統一する。
+
+    Claude が start/end の代わりに start_date/end_date を返すケースもあるため、
+    dict 入力時は両方のキーを候補として受け付ける。
+    """
     if isinstance(value, dict):
+        start_val = value.get("start") if value.get("start") not in (None, "") \
+                    else value.get("start_date")
+        end_val = value.get("end") if value.get("end") not in (None, "") \
+                  else value.get("end_date")
         return {
-            "start": _normalize_date(value.get("start")),
-            "end": _normalize_date(value.get("end")),
+            "start": _normalize_date(start_val),
+            "end": _normalize_date(end_val),
         }
     if value is None:
         return {"start": "", "end": ""}
@@ -125,6 +139,26 @@ def _s(value: Any) -> str:
     return str(value).strip()
 
 
+def _first(raw: dict, *keys: str) -> Any:
+    """raw から先頭にヒットしたキーの値を返す (別名キー吸収用)。
+
+    Claude が JSON のキー名をプロンプト指定どおりに返さず、
+    類似名 (group_home_name, creation_month, service_manager 等) を
+    使うケースがあるため、優先順位つきで別名キーを受け付ける。
+
+    Args:
+        raw: Claude 応答 dict。
+        keys: 優先順のキー名リスト。
+
+    Returns:
+        最初にヒットしたキーの値。どれも無ければ None。
+    """
+    for k in keys:
+        if k in raw and raw[k] not in (None, ""):
+            return raw[k]
+    return None
+
+
 def normalize(document_type: str, raw: dict) -> dict:
     """書類種別ごとに抽出結果を正規化する。
 
@@ -147,10 +181,14 @@ def normalize(document_type: str, raw: dict) -> dict:
         result["home_name"] = _s(raw.get("home_name"))
 
     elif document_type == "plan_draft":
-        result["home_name"] = _s(raw.get("home_name"))
-        result["created_date"] = _normalize_date(raw.get("created_date"))
+        # Claude がプロンプト指定と違うキー名で返すケースを吸収
+        # (group_home_name, creation_month, service_manager 等)
+        result["home_name"] = _s(_first(raw, "home_name", "group_home_name"))
+        result["created_date"] = _normalize_date(
+            _first(raw, "created_date", "creation_month", "creation_date")
+        )
         result["plan_period"] = _normalize_plan_period(raw.get("plan_period"))
-        result["author"] = _s(raw.get("author"))
+        result["author"] = _s(_first(raw, "author", "service_manager", "creator"))
 
     elif document_type == "meeting_record":
         result["meeting_date"] = _normalize_date(raw.get("meeting_date"))
