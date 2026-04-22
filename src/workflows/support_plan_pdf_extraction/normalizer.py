@@ -186,9 +186,34 @@ def normalize(document_type: str, raw: dict) -> dict:
     }
 
     if document_type == "assessment":
-        result["date"] = _normalize_date(raw.get("date"))
-        result["user_name"] = _s(raw.get("user_name"))
-        result["home_name"] = _s(raw.get("home_name"))
+        # Claude が日本語キー (作成日 / 利用者名 / 事業所 等) で返すケースを吸収
+        result["date"] = _normalize_date(_first(
+            raw,
+            "date", "creation_date", "assessment_date",
+            "作成日", "記入日", "実施日", "アセスメント日",
+        ))
+        result["user_name"] = _s(_first(
+            raw,
+            "user_name", "client_name",
+            "利用者名", "氏名", "対象者", "利用者氏名",
+        ))
+        result["home_name"] = _s(_first(
+            raw,
+            "home_name", "group_home_name", "office_name",
+            "ホーム名", "事業所", "事業所名", "グループホーム名",
+        ))
+
+        # 主要項目が全て空なら review_required=true に強制
+        if (
+            not result["date"]
+            and not result["user_name"]
+            and not result["home_name"]
+        ):
+            result["review_required"] = True
+            if not result.get("review_comment"):
+                result["review_comment"] = (
+                    "主要項目が全て空 (Claude キー名不一致の可能性)"
+                )
 
     elif document_type == "plan_draft":
         # Claude がプロンプト指定と違うキー名 (英語別名 / 日本語キー) で返す
