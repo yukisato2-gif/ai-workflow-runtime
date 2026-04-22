@@ -289,13 +289,96 @@ def normalize(document_type: str, raw: dict) -> dict:
                 )
 
     elif document_type == "plan_final":
-        result["home_name"] = _s(raw.get("home_name"))
-        result["created_date"] = _normalize_date(raw.get("created_date"))
-        result["plan_period"] = _normalize_plan_period(raw.get("plan_period"))
-        result["author"] = _s(raw.get("author"))
-        result["consent_date"] = _normalize_date(raw.get("consent_date"))
-        result["signature"] = _normalize_mark(raw.get("signature"))
-        result["seal"] = _normalize_mark(raw.get("seal"))
+        # Claude が日本語キー + ネスト構造で返すケースを吸収
+        # 作成者が dict {役職, 氏名, 押印}、同意が dict {同意日, 利用者確認, ...}
+        # という複合構造で返ることがある
+
+        result["home_name"] = _s(_first(
+            raw,
+            "home_name", "group_home_name",
+            "グループホーム名", "ホーム名", "事業所名",
+        ))
+        result["created_date"] = _normalize_date(_first(
+            raw,
+            "created_date", "creation_date", "creation_month",
+            "作成日", "作成月",
+        ))
+        result["plan_period"] = _normalize_plan_period(
+            _first(raw, "plan_period", "計画期間")
+        )
+
+        # 作成者: dict {役職, 氏名, 押印} / {役職名: 氏名} / str を吸収
+        author_val = _first(
+            raw,
+            "author", "service_manager", "creator",
+            "作成者", "サービス管理責任者", "記載者",
+        )
+        if isinstance(author_val, dict):
+            # 氏名/name を優先、無ければ最初の非空文字列値 (役職名キーで氏名が値)
+            author_name = author_val.get("氏名") or author_val.get("name")
+            if not author_name:
+                for v in author_val.values():
+                    if isinstance(v, str) and v.strip() and v.strip() not in (
+                        "あり", "なし", "○", "×", "〇", "ｘ",
+                    ):
+                        author_name = v
+                        break
+            result["author"] = _s(author_name or "")
+        else:
+            result["author"] = _s(author_val)
+
+        # 同意関連: dict {同意日, 利用者確認, ...} or フラット
+        consent_val = _first(raw, "同意", "consent")
+        if isinstance(consent_val, dict):
+            consent_date_val = (
+                consent_val.get("同意日")
+                or consent_val.get("consent_date")
+                or ""
+            )
+            user_confirm = _s(consent_val.get("利用者確認") or "")
+        else:
+            consent_date_val = _first(raw, "consent_date", "同意日")
+            # フラット構造でも 利用者確認 キーを拾う
+            user_confirm = _s(
+                _first(raw, "利用者確認", "consent_confirmation") or ""
+            )
+        result["consent_date"] = _normalize_date(consent_date_val)
+
+        # signature: 明示キー or 同意.利用者確認 の記述から判定
+        sig_raw = _first(raw, "signature", "署名")
+        if sig_raw:
+            result["signature"] = _normalize_mark(sig_raw)
+        elif user_confirm and "署名" in user_confirm:
+            # 「久島広司（署名・押印あり）」のような記述で ○ とみなす
+            result["signature"] = "○"
+        else:
+            result["signature"] = ""
+
+        # seal: 明示キー or 同意.利用者確認 の記述から判定
+        seal_raw = _first(raw, "seal", "捺印", "押印")
+        if seal_raw:
+            result["seal"] = _normalize_mark(seal_raw)
+        elif user_confirm and ("押印" in user_confirm or "捺印" in user_confirm):
+            result["seal"] = "○"
+        else:
+            result["seal"] = ""
+
+        # 主要項目が全て空なら review_required=true を強制
+        if (
+            not result["home_name"]
+            and not result["created_date"]
+            and not result["plan_period"].get("start")
+            and not result["plan_period"].get("end")
+            and not result["author"]
+            and not result["consent_date"]
+            and not result["signature"]
+            and not result["seal"]
+        ):
+            result["review_required"] = True
+            if not result.get("review_comment"):
+                result["review_comment"] = (
+                    "主要項目が全て空 (Claude キー名不一致の可能性)"
+                )
 
     elif document_type == "monitoring":
         # Claude が深くネストした日本語構造 (文書情報.xxx) を返すケースを吸収。
