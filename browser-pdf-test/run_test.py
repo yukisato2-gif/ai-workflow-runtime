@@ -709,51 +709,108 @@ async def send_prompt(page, prompt: str) -> None:
         resp_count_before = await page.locator("div.font-claude-response").count()
     except Exception:
         resp_count_before = 0
+    try:
+        send_btn_count_before = await page.locator(
+            'button[aria-label*="送信"], button[aria-label*="Send"]'
+        ).count()
+    except Exception:
+        send_btn_count_before = 0
 
-    async def _input_is_empty() -> bool:
-        """送信成功か判定。以下のいずれかで成功とみなす。
-          1) Claude 応答要素 (div.font-claude-response) が新たに増えた
-          2) URL が /chat/ へ遷移した (送信前から変化)
-          3) 入力欄が消滅した
-          4) 入力欄の中身が空になった
+    async def _wait_for_send_success(max_poll_sec: float = 8.0,
+                                     interval_sec: float = 0.5) -> tuple[bool, str]:
+        """複数シグナルの OR 判定で送信成功を短ポーリング検知する。
+
+        成功シグナル (優先順):
+          1) 応答要素 (div.font-claude-response) の個数が送信前より増えた
+          2) URL に /chat/ が含まれる状態で維持されている
+             (/new から即 redirect 済みケースも含む = URL に /chat/ が含まれれば OK)
+          3) 入力欄が消滅した or 中身が空になった
+          4) 送信ボタンが送信前より減った / disabled 化した
+
+        Returns:
+            (成功したか, 判定根拠の説明)
         """
-        # 1) 応答要素が増えた = 送信成功 (最も確実)
-        try:
-            resp_count_now = await page.locator("div.font-claude-response").count()
+        import asyncio
+        deadline = asyncio.get_event_loop().time() + max_poll_sec
+        iteration = 0
+        while True:
+            iteration += 1
+            # 現在の URL
+            try:
+                current_url = page.url
+            except Exception:
+                current_url = ""
+            # 応答要素数
+            try:
+                resp_count_now = await page.locator("div.font-claude-response").count()
+            except Exception:
+                resp_count_now = resp_count_before
+            # 入力欄の状態
+            input_empty = False
+            input_disappeared = False
+            try:
+                cnt = await page.locator(used_selector).count()
+                if cnt == 0:
+                    input_disappeared = True
+                else:
+                    try:
+                        inner = await page.locator(used_selector).first.inner_text(timeout=1_000)
+                        input_empty = not inner or len(inner.strip()) == 0
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # 送信ボタン数
+            try:
+                send_btn_count_now = await page.locator(
+                    'button[aria-label*="送信"], button[aria-label*="Send"]'
+                ).count()
+            except Exception:
+                send_btn_count_now = send_btn_count_before
+
+            log.info(
+                "[Send] success-check iter=%d url=%s response_count=%d "
+                "input_empty=%s input_disappeared=%s send_btn_count=%d",
+                iteration, current_url, resp_count_now,
+                input_empty, input_disappeared, send_btn_count_now,
+            )
+
+            # (1) 応答要素が増えた
             if resp_count_now > resp_count_before:
-                return True
-        except Exception:
-            pass
-        # 2) URL 遷移
-        try:
-            if "/chat/" in page.url and page.url != url_before_send:
-                return True
-        except Exception:
-            pass
-        # 3) 入力欄が消えた
-        try:
-            cnt = await page.locator(used_selector).count()
-            if cnt == 0:
-                return True
-        except Exception:
-            pass
-        # 4) 入力欄の中身が空
-        try:
-            inner = await page.locator(used_selector).first.inner_text(timeout=2_000)
-        except Exception:
-            return False
-        return not inner or len(inner.strip()) == 0
+                log.info("[Send] success detected by response element")
+                return True, "response_element"
+            # (2) URL が /chat/ を含む (維持されている)
+            if "/chat/" in current_url:
+                log.info("[Send] success detected by chat url")
+                return True, "chat_url"
+            # (3) 入力欄が消滅 / 空
+            if input_disappeared:
+                log.info("[Send] success detected by input disappeared")
+                return True, "input_disappeared"
+            if input_empty:
+                log.info("[Send] success detected by empty input")
+                return True, "empty_input"
+            # (4) 送信ボタンが減った (補助)
+            if send_btn_count_now < send_btn_count_before:
+                log.info("[Send] success detected by send button count decrease")
+                return True, "send_btn_decrease"
+
+            # deadline チェック
+            if asyncio.get_event_loop().time() >= deadline:
+                log.info("[Send] success-check timed out; fallback to button")
+                return False, "timeout"
+            await asyncio.sleep(interval_sec)
 
     # --- 方法1: Enter キー送信 (最優先) ---
     tried_send.append("Enter キー (最優先)")
     try:
         log.info("[Send] Enter送信実行")
         await page.keyboard.press("Enter")
-        await page.wait_for_timeout(2000)
-        if await _input_is_empty():
+        ok, reason = await _wait_for_send_success(max_poll_sec=8.0, interval_sec=0.5)
+        if ok:
             sent = True
-            send_method = "Enter"
-            log.info("[Send] 送信成功 (Enter キー)")
+            send_method = f"Enter ({reason})"
+            log.info("[Send] 送信成功 (Enter キー, 根拠=%s)", reason)
     except Exception as e:
         log.debug("[Send] Enter 送信失敗: %s", e)
 
@@ -773,12 +830,14 @@ async def send_prompt(page, prompt: str) -> None:
                 btn = page.locator(selector).first
                 if await btn.count() > 0 and await btn.is_visible(timeout=2_000):
                     await btn.click(timeout=3_000)
-                    await page.wait_for_timeout(1500)
-                    if await _input_is_empty():
+                    ok, reason = await _wait_for_send_success(
+                        max_poll_sec=6.0, interval_sec=0.5
+                    )
+                    if ok:
                         sent = True
-                        send_method = f"button: {selector}"
+                        send_method = f"button: {selector} ({reason})"
                         log.info("[Send] 使用ボタンセレクタ: %s", selector)
-                        log.info("[Send] 送信成功 (ボタン: %s)", selector)
+                        log.info("[Send] 送信成功 (ボタン: %s, 根拠=%s)", selector, reason)
                         break
             except Exception as e:
                 log.debug("[Send] 送信ボタン失敗 (%s): %s", selector, e)
@@ -792,12 +851,14 @@ async def send_prompt(page, prompt: str) -> None:
                 btn = page.locator(selector).first
                 if await btn.count() > 0 and await btn.is_visible(timeout=2_000):
                     await btn.click(timeout=3_000)
-                    await page.wait_for_timeout(1500)
-                    if await _input_is_empty():
+                    ok, reason = await _wait_for_send_success(
+                        max_poll_sec=6.0, interval_sec=0.5
+                    )
+                    if ok:
                         sent = True
-                        send_method = f"button: {selector}"
+                        send_method = f"button: {selector} ({reason})"
                         log.info("[Send] 使用ボタンセレクタ: %s", selector)
-                        log.info("[Send] 送信成功 (ボタン: %s)", selector)
+                        log.info("[Send] 送信成功 (ボタン: %s, 根拠=%s)", selector, reason)
                         break
             except Exception as e:
                 log.debug("[Send] 送信ボタン失敗 (%s): %s", selector, e)
