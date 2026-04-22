@@ -125,9 +125,15 @@ def _normalize_participants(value: Any) -> str:
 
 
 def _normalize_mark(value: Any) -> str:
-    """署名・捺印を "○" / "×" / "" の3値に正規化する。"""
+    """署名・捺印を "○" / "×" / "" の3値に正規化する。
+
+    boolean (True/False) も「あり/なし」として扱う
+    (Claude が「押印: true」のような形式で返すケース対応)。
+    """
     if value is None:
         return ""
+    if isinstance(value, bool):
+        return "○" if value else "×"
     s = str(value).strip()
     if s in ("○", "〇", "o", "O", "有", "あり"):
         return "○"
@@ -313,11 +319,12 @@ def normalize(document_type: str, raw: dict) -> dict:
             "author", "service_manager", "creator",
             "作成者", "サービス管理責任者", "記載者",
         )
-        if isinstance(author_val, dict):
+        author_dict = author_val if isinstance(author_val, dict) else None
+        if author_dict is not None:
             # 氏名/name を優先、無ければ最初の非空文字列値 (役職名キーで氏名が値)
-            author_name = author_val.get("氏名") or author_val.get("name")
+            author_name = author_dict.get("氏名") or author_dict.get("name")
             if not author_name:
-                for v in author_val.values():
+                for v in author_dict.values():
                     if isinstance(v, str) and v.strip() and v.strip() not in (
                         "あり", "なし", "○", "×", "〇", "ｘ",
                     ):
@@ -327,15 +334,18 @@ def normalize(document_type: str, raw: dict) -> dict:
         else:
             result["author"] = _s(author_val)
 
-        # 同意関連: dict {同意日, 利用者確認, ...} or フラット
-        consent_val = _first(raw, "同意", "consent")
-        if isinstance(consent_val, dict):
+        # 同意関連: dict {同意日, 利用者確認, 署名, 押印, ...} or フラット
+        # キー候補: 同意確認 / 同意 / consent (同意確認 を最優先)
+        consent_val = _first(raw, "同意確認", "同意", "consent")
+        consent_dict = consent_val if isinstance(consent_val, dict) else None
+        if consent_dict is not None:
             consent_date_val = (
-                consent_val.get("同意日")
-                or consent_val.get("consent_date")
+                consent_dict.get("同意日")
+                or consent_dict.get("consent_date")
+                or consent_dict.get("日付")
                 or ""
             )
-            user_confirm = _s(consent_val.get("利用者確認") or "")
+            user_confirm = _s(consent_dict.get("利用者確認") or "")
         else:
             consent_date_val = _first(raw, "consent_date", "同意日")
             # フラット構造でも 利用者確認 キーを拾う
@@ -344,19 +354,49 @@ def normalize(document_type: str, raw: dict) -> dict:
             )
         result["consent_date"] = _normalize_date(consent_date_val)
 
+        def _pick_nested(*keys):
+            """raw 直下 → 同意確認/同意/consent dict 内 → 作成者 dict 内
+            の優先順で最初にヒットした値を返す。bool/False も尊重するため
+            「キーが存在するか」で判定する (None/"" のみ未設定扱い)。
+            """
+            for k in keys:
+                if k in raw and raw[k] not in (None, ""):
+                    return raw[k]
+            for src in (consent_dict, author_dict):
+                if not src:
+                    continue
+                for k in keys:
+                    if k in src and src[k] not in (None, ""):
+                        return src[k]
+            # bool False を取りこぼさないため、最後にもう一度 False 許容で探索
+            for src in (raw, consent_dict or {}, author_dict or {}):
+                for k in keys:
+                    if k in src and isinstance(src[k], bool):
+                        return src[k]
+            return None
+
         # signature: 明示キー or 同意.利用者確認 の記述から判定
-        sig_raw = _first(raw, "signature", "署名")
-        if sig_raw:
+        # 利用者確認 が「氏名（押印あり）」形式の場合、氏名部分が署名相当のため ○
+        # (なし/未確認 等の否定語のみ含む場合は署名なし扱い)
+        sig_raw = _pick_nested("signature", "署名", "署名有無")
+        if sig_raw is not None:
             result["signature"] = _normalize_mark(sig_raw)
-        elif user_confirm and "署名" in user_confirm:
-            # 「久島広司（署名・押印あり）」のような記述で ○ とみなす
-            result["signature"] = "○"
+        elif user_confirm:
+            uc_lower = user_confirm.replace(" ", "").replace("　", "")
+            if "署名" in user_confirm or "押印" in user_confirm or "捺印" in user_confirm:
+                # 「久島広司（署名・押印あり）」「久島広司（押印あり）」等
+                result["signature"] = "○"
+            elif uc_lower in ("なし", "無", "未確認", "確認なし", "未"):
+                result["signature"] = "×"
+            else:
+                # 氏名のみ等、非空であれば署名相当とみなす
+                result["signature"] = "○"
         else:
             result["signature"] = ""
 
         # seal: 明示キー or 同意.利用者確認 の記述から判定
-        seal_raw = _first(raw, "seal", "捺印", "押印")
-        if seal_raw:
+        seal_raw = _pick_nested("seal", "捺印", "押印", "捺印有無", "押印有無")
+        if seal_raw is not None:
             result["seal"] = _normalize_mark(seal_raw)
         elif user_confirm and ("押印" in user_confirm or "捺印" in user_confirm):
             result["seal"] = "○"

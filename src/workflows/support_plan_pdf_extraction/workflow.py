@@ -163,21 +163,8 @@ def run_support_plan_workflow(
                 raw = parse_claude_response(retry_response)
                 logger.info("リトライで JSON 化成功")
 
-            # === [DEBUG-TEMP] 3 段階確認 (確認後に削除すること) ===
-            import json as _json
-            logger.info("[DEBUG-TEMP] raw JSON keys: %s",
-                        list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__)
-            logger.info("[DEBUG-TEMP] raw JSON 全値: %s",
-                        _json.dumps(raw, ensure_ascii=False))
-            # === [DEBUG-TEMP] ここまで ===
-
             # 5. 正規化
             normalized = normalize(doc_type, raw)
-
-            # === [DEBUG-TEMP] 3 段階確認 ===
-            logger.info("[DEBUG-TEMP] normalized 全値: %s",
-                        _json.dumps(normalized, ensure_ascii=False))
-            # === [DEBUG-TEMP] ここまで ===
 
             # 6. シート追記
             append_row(pdf_path, normalized)
