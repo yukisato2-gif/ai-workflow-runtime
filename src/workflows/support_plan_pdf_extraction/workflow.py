@@ -148,7 +148,11 @@ def run_support_plan_workflow(
                     "JSON パース失敗 → 強力プロンプトで 1 回だけ再送: %s",
                     parse_err,
                 )
-                time.sleep(POST_CLAUDE_SLEEP_SEC)
+                # CDP Chrome のタブ状態が落ち着くまで余裕を持って待機
+                # (リトライ直後は send_input が失敗しやすいため sleep を拡張)
+                retry_wait = POST_CLAUDE_SLEEP_SEC * 3
+                logger.info("リトライ前 sleep %d 秒開始", retry_wait)
+                time.sleep(retry_wait)
                 retry_response = run_claude_on_pdf(pdf_path, RETRY_JSON_ONLY_PROMPT)
                 logger.info("sleep %d 秒開始 (リトライ後クールダウン)",
                             POST_CLAUDE_SLEEP_SEC)
