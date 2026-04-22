@@ -5,8 +5,11 @@
     export SUPPORT_PLAN_INPUT_DIR="/path/to/folder"
     python scripts/run_support_plan.py
 
-    # または引数で指定
+    # または引数で指定 (フォルダ)
     python scripts/run_support_plan.py /path/to/folder
+
+    # 単一 PDF ファイル 1 件だけ処理 (完走検証用)
+    python scripts/run_support_plan.py /path/to/file.pdf
 """
 
 from __future__ import annotations
@@ -33,11 +36,19 @@ def main() -> None:
         load_dotenv(dotenv_path=env_path, override=False)
 
     folder: Path | None = None
+    pdf_file: Path | None = None
     if len(sys.argv) >= 2:
-        folder = Path(sys.argv[1])
+        arg = Path(sys.argv[1])
+        # .pdf ファイル指定なら単一 PDF モード、それ以外はフォルダ
+        if arg.is_file() and arg.suffix.lower() == ".pdf":
+            pdf_file = arg
+            logger.info("Single PDF mode: %s", pdf_file)
+        else:
+            folder = arg
+            logger.info("Folder mode: %s", folder)
 
     try:
-        stats = run_support_plan_workflow(folder=folder)
+        stats = run_support_plan_workflow(folder=folder, pdf_file=pdf_file)
     except Exception as e:
         logger.error("Workflow aborted: %s", e)
         sys.exit(1)

@@ -44,35 +44,47 @@ POST_CLAUDE_SLEEP_SEC = int(os.getenv("SUPPORT_PLAN_POST_CLAUDE_SLEEP", "5"))
 def run_support_plan_workflow(
     folder: Path | None = None,
     state_file: Path | None = None,
+    pdf_file: Path | None = None,
 ) -> dict:
-    """対象フォルダ内の PDF を順に処理する。
+    """対象の PDF を処理する。
+
+    folder / pdf_file のいずれかを指定する (両方省略時は環境変数 SUPPORT_PLAN_INPUT_DIR)。
+    pdf_file が指定された場合はそのファイル 1 件のみを処理する (単一 PDF 完走検証用)。
 
     Args:
-        folder: 対象フォルダ。None の場合は環境変数 SUPPORT_PLAN_INPUT_DIR を参照。
+        folder: 対象フォルダ。配下の PDF を再帰的に列挙して処理する。
         state_file: 状態ファイルのパス。None の場合は既定を使用。
+        pdf_file: 単一 PDF ファイルのパス。指定時は folder よりも優先。
 
     Returns:
         {"processed": n, "skipped": m, "failed": f, "unknown": u}
     """
-    # 対象フォルダ解決
-    if folder is None:
-        env_dir = os.getenv("SUPPORT_PLAN_INPUT_DIR", "")
-        if not env_dir:
-            raise RuntimeError(
-                "対象フォルダが指定されていません。引数 folder か "
-                "環境変数 SUPPORT_PLAN_INPUT_DIR を設定してください。"
-            )
-        folder = Path(env_dir)
+    # 処理対象 PDF の解決
+    if pdf_file is not None:
+        if not pdf_file.exists() or not pdf_file.is_file():
+            raise RuntimeError(f"PDF ファイルが見つかりません: {pdf_file}")
+        pdfs = [pdf_file.resolve()]
+        target_label = f"single PDF: {pdf_file}"
+    else:
+        if folder is None:
+            env_dir = os.getenv("SUPPORT_PLAN_INPUT_DIR", "")
+            if not env_dir:
+                raise RuntimeError(
+                    "対象が指定されていません。pdf_file / folder / "
+                    "環境変数 SUPPORT_PLAN_INPUT_DIR のいずれかを設定してください。"
+                )
+            folder = Path(env_dir)
+        pdfs = list_pdfs(folder)
+        target_label = f"folder: {folder}"
 
     logger.info("=" * 60)
     logger.info("  Support Plan PDF Extraction Workflow")
     logger.info("  (方式: ローカルPDFを Claude ブラウザへ添付して読む)")
     logger.info("=" * 60)
-    logger.info("Target folder: %s", folder)
+    logger.info("Target: %s", target_label)
 
     store = StateStore(state_file=state_file)
 
-    pdfs = list_pdfs(folder)
     logger.info("Total PDFs found: %d", len(pdfs))
 
     stats = {"processed": 0, "skipped": 0, "failed": 0, "unknown": 0}
