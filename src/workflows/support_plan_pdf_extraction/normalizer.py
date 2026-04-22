@@ -241,11 +241,62 @@ def normalize(document_type: str, raw: dict) -> dict:
         result["seal"] = _normalize_mark(raw.get("seal"))
 
     elif document_type == "monitoring":
-        result["author"] = _s(raw.get("author"))
-        result["implementation_date"] = _normalize_date(raw.get("implementation_date"))
-        result["participants"] = _normalize_participants(raw.get("participants"))
-        result["plan_period"] = _normalize_plan_period(raw.get("plan_period"))
-        result["next_monitoring_date"] = _normalize_date(raw.get("next_monitoring_date"))
+        # Claude が深くネストした日本語構造 (文書情報.xxx) を返すケースを吸収。
+        # 文書情報 dict があれば、外側を優先しつつ中身を raw にマージする
+        # (フラット化してから通常の別名マッピングで拾う)
+        if "文書情報" in raw and isinstance(raw["文書情報"], dict):
+            raw = {**raw["文書情報"], **{k: v for k, v in raw.items() if k != "文書情報"}}
+
+        # モニタリング実施者 は dict ({氏名, 役職}) で返ることがあるので氏名を取り出す
+        monitoring_person = _first(
+            raw, "モニタリング実施者", "サービス管理責任者", "実施者"
+        )
+        if isinstance(monitoring_person, dict):
+            monitoring_person = monitoring_person.get("氏名") or ""
+
+        result["author"] = _s(_first(
+            raw,
+            "author", "service_manager", "creator",
+            "作成者", "記載者",
+        )) or _s(monitoring_person)
+
+        result["implementation_date"] = _normalize_date(_first(
+            raw,
+            "implementation_date",
+            "実施日", "モニタリング実施日",
+        ))
+
+        result["participants"] = _normalize_participants(_first(
+            raw,
+            "participants", "参加者",
+        ))
+
+        # 計画期間: plan_period / 計画実施期間 / 計画期間 のいずれか
+        result["plan_period"] = _normalize_plan_period(_first(
+            raw, "plan_period", "計画実施期間", "計画期間"
+        ))
+
+        result["next_monitoring_date"] = _normalize_date(_first(
+            raw,
+            "next_monitoring_date",
+            "次回モニタリング時期", "次回モニタリング予定",
+            "次回実施日", "次回実施時期",
+        ))
+
+        # 主要項目が全て空なら review_required=true に強制
+        if (
+            not result["author"]
+            and not result["implementation_date"]
+            and not result["participants"]
+            and not result["plan_period"].get("start")
+            and not result["plan_period"].get("end")
+            and not result["next_monitoring_date"]
+        ):
+            result["review_required"] = True
+            if not result.get("review_comment"):
+                result["review_comment"] = (
+                    "主要項目が全て空 (Claude キー名不一致の可能性)"
+                )
 
     else:
         # unknown 等: そのまま raw を残す
