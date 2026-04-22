@@ -26,7 +26,28 @@ PROMPT_FILES: dict[str, str] = {
     "monitoring": "monitoring.md",
 }
 
-# JSON 強制指示ブロック
+# JSON 強制指示ブロック (冒頭)
+# プロンプト本文より前に置くことで、Claude が末尾指示を軽視する
+# 挙動を抑止する。PREFIX + 本文 + SUFFIX の順で結合される。
+JSON_ONLY_PREFIX = """あなたはデータ抽出専用エンジンです。
+
+これから渡されるPDFから情報を抽出し、
+必ずJSONのみを返してください。
+
+重要:
+- 日本語の説明は禁止
+- 挨拶は禁止
+- 要約は禁止
+- 質問は禁止
+- コードフェンスは禁止
+- 文章は禁止
+
+出力は必ず1つのJSONオブジェクトのみとし、
+1文字目は必ず { で開始してください。
+"""
+
+
+# JSON 強制指示ブロック (末尾)
 # プロンプトが自然文応答を返すのを防ぐため、load_prompt() の末尾に必ず付加する。
 # Claude が自然文で応答する癖を強く抑止する目的で、冒頭で強制宣言し、
 # 禁止事項を具体例つきで列挙し、末尾で再度念押しする。
@@ -110,8 +131,11 @@ def load_prompt(document_type: str) -> str:
             f"Set COWORK_ASSETS_DIR or SUPPORT_PLAN_PROMPTS_DIR environment variable."
         )
 
-    # cowork-assets のプロンプト本体に加え、JSON 強制指示を末尾に必ず付加する
-    return prompt_path.read_text(encoding="utf-8") + JSON_ONLY_SUFFIX
+    # JSON 強制指示を冒頭・末尾の両方に配置することで、
+    # Claude が末尾指示を軽視する挙動を抑止する。
+    # 結合順: PREFIX + "\n\n" + 本文 + "\n\n" + SUFFIX
+    body = prompt_path.read_text(encoding="utf-8")
+    return JSON_ONLY_PREFIX + "\n\n" + body + "\n\n" + JSON_ONLY_SUFFIX
 
 
 def _try_parse_json(candidate: str) -> dict | None:
