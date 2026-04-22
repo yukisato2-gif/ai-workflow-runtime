@@ -40,6 +40,16 @@ logger = get_logger(__name__)
 # 環境変数 SUPPORT_PLAN_POST_CLAUDE_SLEEP で上書き可能
 POST_CLAUDE_SLEEP_SEC = int(os.getenv("SUPPORT_PLAN_POST_CLAUDE_SLEEP", "5"))
 
+# 自然文応答になった場合の 1 回だけ再送するリトライプロンプト
+# 既存の load_prompt() 経由のプロンプトが JSON 化されなかったケース向け。
+# (browser_reader の契約上、厳密な「同一チャット内再送」は困難なため、
+#  新しいチャットを開いて強力な JSON-only プロンプトで再添付して再送する)
+RETRY_JSON_ONLY_PROMPT = """前回の内容を、説明・挨拶・コードフェンスなしで、JSONのみで出力し直してください。
+回答は必ず { で始まる単一のJSONオブジェクトだけにしてください。
+不明値は null にしてください。
+JSON以外の文字を1文字も含めないでください。
+"""
+
 
 def run_support_plan_workflow(
     folder: Path | None = None,
@@ -130,8 +140,24 @@ def run_support_plan_workflow(
             time.sleep(POST_CLAUDE_SLEEP_SEC)
             logger.info("sleep 終了")
 
-            # 4. JSON パース
-            raw = parse_claude_response(response)
+            # 4. JSON パース (失敗時は 1 回だけ強力 JSON プロンプトで再送)
+            try:
+                raw = parse_claude_response(response)
+            except Exception as parse_err:
+                logger.warning(
+                    "JSON パース失敗 → 強力プロンプトで 1 回だけ再送: %s",
+                    parse_err,
+                )
+                time.sleep(POST_CLAUDE_SLEEP_SEC)
+                retry_response = run_claude_on_pdf(pdf_path, RETRY_JSON_ONLY_PROMPT)
+                logger.info("sleep %d 秒開始 (リトライ後クールダウン)",
+                            POST_CLAUDE_SLEEP_SEC)
+                time.sleep(POST_CLAUDE_SLEEP_SEC)
+                logger.info("sleep 終了")
+                # 2 回目も失敗したら例外を再送 (外側の except Exception で捕捉 →
+                # 従来の review_required=true 追記パスへ)
+                raw = parse_claude_response(retry_response)
+                logger.info("リトライで JSON 化成功")
 
             # 5. 正規化
             normalized = normalize(doc_type, raw)
