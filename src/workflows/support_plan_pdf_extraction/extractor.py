@@ -5,6 +5,8 @@ cowork-assets のパスは環境変数 COWORK_ASSETS_DIR で指定可能。
 既定値は ai-workflow-runtime の兄弟ディレクトリ。
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -98,14 +100,43 @@ def load_prompt(document_type: str) -> str:
     return prompt_path.read_text(encoding="utf-8") + JSON_ONLY_SUFFIX
 
 
+def _try_parse_json(candidate: str) -> dict | None:
+    """候補文字列を JSON としてパースする。失敗時は None。"""
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    # JSON としては文字列や数値もあり得るが、ワークフローは dict を期待する。
+    # dict 以外 (list, str 等) は None として次のパターンに委ねる。
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _try_parse_json_any(candidate: str) -> dict | list | None:
+    """配列サルベージ用: list も許容する。失敗時は None。"""
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, (dict, list)):
+        return parsed
+    return None
+
+
 def parse_claude_response(response_text: str) -> dict:
     """Claude の応答テキストから JSON を抽出・パースする。
 
-    以下のサルベージを順に試みる:
-      1. そのまま json.loads
-      2. ```json ... ``` や ``` ... ``` コードフェンス除去後に json.loads
-      3. 自然文が混入している場合、最初の "{" から最後の "}" までを
-         抽出して json.loads (前置き・後置き文を除去)
+    応答が自然文混じりでも JSON を取り出せるよう、以下の優先順で試行する:
+      (1) ```json ... ``` の fenced block を抽出して parse
+      (2) ``` ... ``` の generic fenced block 内を parse
+      (3) 応答本文全体の最初の "{" から最後の "}" までを抽出して parse
+          (オブジェクトライク候補)
+      (4) (3) が失敗時、最初の "[" から最後の "]" を抽出して parse
+          (配列ライク候補; list の場合は辞書化してラップ)
+      (5) 全て失敗したら応答全文のプレビューをログに残して WorkflowError
+
+    既存の戻り値仕様 (dict) は維持。
 
     Args:
         response_text: Claude 応答テキスト。
@@ -114,45 +145,63 @@ def parse_claude_response(response_text: str) -> dict:
         パース済み dict。
 
     Raises:
-        WorkflowError: 全手段で JSON パースに失敗した場合。
+        WorkflowError: 全手段で JSON 抽出に失敗した場合。
     """
     text = response_text.strip()
 
-    # 試行 1: そのまま
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+    # (1) ```json ... ``` fenced block
+    fenced_json_match = re.search(
+        r"```json\s*\n?(.*?)\n?\s*```", text, re.DOTALL | re.IGNORECASE
+    )
+    if fenced_json_match:
+        candidate = fenced_json_match.group(1).strip()
+        logger.info("[Extractor] fenced json block found (len=%d)", len(candidate))
+        parsed = _try_parse_json(candidate)
+        if parsed is not None:
+            return parsed
+        logger.error("[Extractor] json parse failed for pattern: fenced json block")
 
-    # 試行 2: コードフェンス除去
-    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
-    if fence_match:
-        fenced = fence_match.group(1).strip()
-        logger.debug("コードフェンスから JSON を抽出")
-        try:
-            return json.loads(fenced)
-        except json.JSONDecodeError:
-            text = fenced  # フェンス除去後のテキストで後段サルベージへ
+    # (2) ``` ... ``` generic fenced block
+    fenced_generic_match = re.search(
+        r"```\s*\n?(.*?)\n?\s*```", text, re.DOTALL
+    )
+    if fenced_generic_match:
+        candidate = fenced_generic_match.group(1).strip()
+        logger.info("[Extractor] generic fenced block found (len=%d)", len(candidate))
+        parsed = _try_parse_json(candidate)
+        if parsed is not None:
+            return parsed
+        logger.error("[Extractor] json parse failed for pattern: generic fenced block")
 
-    # 試行 3: 最初の { から最後の } を抽出 (自然文サルベージ)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = text[start : end + 1].strip()
-        logger.debug("自然文サルベージで JSON 抽出試行 (len=%d)", len(candidate))
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError as e:
-            logger.error("サルベージ後も JSON パース失敗: %s", e)
-            logger.error("サルベージ先頭200文字: %s", candidate[:200])
-            raise WorkflowError(
-                f"Claude response is not valid JSON after salvage: {e}. "
-                f"First 100 chars: {candidate[:100]}"
-            ) from e
+    # (3) object-like json candidate: 最初の { から最後の }
+    obj_start = text.find("{")
+    obj_end = text.rfind("}")
+    if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+        candidate = text[obj_start : obj_end + 1].strip()
+        logger.info("[Extractor] object-like json candidate found (len=%d)", len(candidate))
+        parsed = _try_parse_json(candidate)
+        if parsed is not None:
+            return parsed
+        logger.error("[Extractor] json parse failed for pattern: object-like candidate")
 
-    # 全滅
-    logger.error("JSON parse failed: { ... } パターンが見つかりません")
-    logger.error("Response first 200 chars: %s", text[:200])
+    # (4) array-like json candidate: 最初の [ から最後の ]
+    arr_start = text.find("[")
+    arr_end = text.rfind("]")
+    if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+        candidate = text[arr_start : arr_end + 1].strip()
+        logger.info("[Extractor] array-like json candidate found (len=%d)", len(candidate))
+        parsed_any = _try_parse_json_any(candidate)
+        if isinstance(parsed_any, dict):
+            return parsed_any
+        if isinstance(parsed_any, list):
+            # workflow は dict を期待するため、items でラップして返す
+            logger.info("[Extractor] array をラップして dict 化 (items key)")
+            return {"items": parsed_any}
+        logger.error("[Extractor] json parse failed for pattern: array-like candidate")
+
+    # (5) 全滅: 応答全文プレビューをログに残して失敗
+    logger.error("[Extractor] all extraction patterns failed")
+    logger.error("[Extractor] response first 500 chars:\n%s", text[:500])
     raise WorkflowError(
         f"Claude response is not valid JSON. "
         f"First 100 chars: {text[:100]}"
