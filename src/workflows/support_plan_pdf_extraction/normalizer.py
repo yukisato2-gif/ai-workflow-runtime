@@ -223,13 +223,70 @@ def normalize(document_type: str, raw: dict) -> dict:
                 )
 
     elif document_type == "meeting_record":
-        result["meeting_date"] = _normalize_date(raw.get("meeting_date"))
-        result["meeting_time"] = _s(raw.get("meeting_time"))
-        result["recorder"] = _s(raw.get("recorder"))
-        result["location"] = _s(raw.get("location"))
-        result["participants"] = _normalize_participants(raw.get("participants"))
-        result["plan_period"] = _normalize_plan_period(raw.get("plan_period"))
-        result["user_name"] = _s(raw.get("user_name"))
+        # Claude が日本語キーで返すケースを吸収
+        # 開催時間は dict {開始, 終了}、会議出席者は list of dict {職種, 氏名}
+        # という複合構造で返ることがある
+
+        result["meeting_date"] = _normalize_date(_first(
+            raw, "meeting_date", "開催年月日", "開催日"
+        ))
+        result["recorder"] = _s(_first(
+            raw, "recorder", "記入者", "記録者", "作成者", "記載者"
+        ))
+        result["location"] = _s(_first(raw, "location", "開催場所"))
+        result["user_name"] = _s(_first(raw, "user_name", "利用者名", "対象者"))
+
+        # 開催時間: dict {開始, 終了} / str どちらでも受ける
+        mt_val = _first(raw, "meeting_time", "開催時間")
+        if isinstance(mt_val, dict):
+            s = mt_val.get("開始") or mt_val.get("start") or ""
+            e = mt_val.get("終了") or mt_val.get("end") or ""
+            if s and e:
+                result["meeting_time"] = f"{_s(s)}〜{_s(e)}"
+            else:
+                result["meeting_time"] = _s(s or e)
+        else:
+            result["meeting_time"] = _s(mt_val)
+
+        # 参加者: list of dict {職種, 氏名} / list of str / str
+        part_val = _first(raw, "participants", "会議出席者", "参加者")
+        if isinstance(part_val, list):
+            names = []
+            for p in part_val:
+                if isinstance(p, dict):
+                    nm = p.get("氏名") or p.get("name") or ""
+                    if nm:
+                        names.append(str(nm).strip())
+                else:
+                    nm = str(p).strip()
+                    if nm:
+                        names.append(nm)
+            result["participants"] = "、".join(names)
+        else:
+            result["participants"] = _normalize_participants(part_val)
+
+        # 計画期間 (既存ヘルパーが start/end / start_date/end_date /
+        # 開始/終了 / 開始日/終了日 を吸収)
+        result["plan_period"] = _normalize_plan_period(
+            _first(raw, "plan_period", "計画期間")
+        )
+
+        # 主要項目が全て空なら review_required=true を強制
+        if (
+            not result["meeting_date"]
+            and not result["recorder"]
+            and not result["location"]
+            and not result["user_name"]
+            and not result["meeting_time"]
+            and not result["participants"]
+            and not result["plan_period"].get("start")
+            and not result["plan_period"].get("end")
+        ):
+            result["review_required"] = True
+            if not result.get("review_comment"):
+                result["review_comment"] = (
+                    "主要項目が全て空 (Claude キー名不一致の可能性)"
+                )
 
     elif document_type == "plan_final":
         result["home_name"] = _s(raw.get("home_name"))
