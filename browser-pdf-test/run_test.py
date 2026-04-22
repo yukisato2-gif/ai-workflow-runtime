@@ -703,8 +703,41 @@ async def send_prompt(page, prompt: str) -> None:
     send_method = ""
     tried_send: list[str] = []
 
+    # 送信前の状態を記録 (送信成功検知用)
+    url_before_send = page.url
+    try:
+        resp_count_before = await page.locator("div.font-claude-response").count()
+    except Exception:
+        resp_count_before = 0
+
     async def _input_is_empty() -> bool:
-        """入力欄が空 (= 送信された) か判定。"""
+        """送信成功か判定。以下のいずれかで成功とみなす。
+          1) Claude 応答要素 (div.font-claude-response) が新たに増えた
+          2) URL が /chat/ へ遷移した (送信前から変化)
+          3) 入力欄が消滅した
+          4) 入力欄の中身が空になった
+        """
+        # 1) 応答要素が増えた = 送信成功 (最も確実)
+        try:
+            resp_count_now = await page.locator("div.font-claude-response").count()
+            if resp_count_now > resp_count_before:
+                return True
+        except Exception:
+            pass
+        # 2) URL 遷移
+        try:
+            if "/chat/" in page.url and page.url != url_before_send:
+                return True
+        except Exception:
+            pass
+        # 3) 入力欄が消えた
+        try:
+            cnt = await page.locator(used_selector).count()
+            if cnt == 0:
+                return True
+        except Exception:
+            pass
+        # 4) 入力欄の中身が空
         try:
             inner = await page.locator(used_selector).first.inner_text(timeout=2_000)
         except Exception:
