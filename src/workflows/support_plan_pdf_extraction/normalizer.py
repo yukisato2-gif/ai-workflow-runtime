@@ -258,11 +258,18 @@ def normalize(document_type: str, raw: dict) -> dict:
         # 開催時間は dict {開始, 終了}、会議出席者は list of dict {職種, 氏名}
         # という複合構造で返ることがある
 
+        # 開催日: 「開催日」「開催年月日」「実施日」「実施日時」 等を吸収
         result["meeting_date"] = _normalize_date(_first(
-            raw, "meeting_date", "開催年月日", "開催日"
+            raw, "meeting_date",
+            "開催年月日", "開催日",
+            "実施日", "実施日時",
         ))
+        # 記録者: 「記録者」「作成者」「担当者」「記入者」「記載者」 等を吸収
+        # (spec 優先順: 記録者 > 作成者 > 担当者; 旧 「記入者/記載者」 は後方)
         result["recorder"] = _s(_first(
-            raw, "recorder", "記入者", "記録者", "作成者", "記載者"
+            raw, "recorder",
+            "記録者", "作成者", "担当者",
+            "記入者", "記載者",
         ))
         result["location"] = _s(_first(raw, "location", "開催場所"))
         result["user_name"] = _s(_first(raw, "user_name", "利用者名", "対象者"))
@@ -280,7 +287,12 @@ def normalize(document_type: str, raw: dict) -> dict:
             result["meeting_time"] = _s(mt_val)
 
         # 参加者: list of dict {職種, 氏名} / list of str / str
-        part_val = _first(raw, "participants", "会議出席者", "参加者")
+        # キー揺れ: 「参加者」「出席者」「出席者一覧」「会議出席者」 等
+        part_val = _first(
+            raw,
+            "participants",
+            "参加者", "出席者", "出席者一覧", "会議出席者",
+        )
         if isinstance(part_val, list):
             names = []
             for p in part_val:

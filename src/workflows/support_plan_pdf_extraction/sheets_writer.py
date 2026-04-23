@@ -67,8 +67,9 @@ COLUMN_MAPPINGS: dict[str, list[str]] = {
     ],
     "meeting_record": [
         "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別",
-        "開催日", "開催時間", "記載者", "開催場所", "参加者",
-        "計画期間_開始日", "計画期間_終了日", "利用者名", "備考",
+        "開催日", "開催時間", "記録者", "開催場所", "参加者",
+        "計画期間_開始日", "計画期間_終了日", "利用者名",
+        "抽出できなかった項目", "備考",
     ],
     "plan_final": [
         "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別",
@@ -214,15 +215,19 @@ def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
     if not isinstance(plan_period, dict):
         plan_period = {}
 
-    # monitoring の最終仕上げ用フラグ:
+    # 仕上げフラグ:
     # - 日付列は YYYY/MM(/DD) に厳密一致しない値を空にして missing 化
     # - participants は str 入力時も区切りを「、」に正規化
+    # - 拠点 は PDF 親フォルダから補完
+    # monitoring + meeting_record で同等の品質を適用 (他帳票は従来挙動維持)
     is_monitoring = (doc_type == "monitoring")
+    is_meeting_record = (doc_type == "meeting_record")
+    strict_format = is_monitoring or is_meeting_record
 
     # 共通メタ列
     if col_name == "拠点":
-        # 拠点補完は monitoring のみ (他帳票は従来どおり空文字維持)
-        if is_monitoring:
+        # 拠点補完は monitoring + meeting_record (他帳票は従来どおり空文字維持)
+        if is_monitoring or is_meeting_record:
             return _derive_site(ctx["pdf_path"])
         return ""
     if col_name == "処理日時":
@@ -251,22 +256,23 @@ def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
     if col_name == "作成日":
         return _format_date(norm.get("created_date"))
     if col_name == "計画期間_開始日":
-        return _format_date(plan_period.get("start"), strict=is_monitoring)
+        return _format_date(plan_period.get("start"), strict=strict_format)
     if col_name == "計画期間_終了日":
-        return _format_date(plan_period.get("end"), strict=is_monitoring)
+        return _format_date(plan_period.get("end"), strict=strict_format)
     if col_name in ("作成者", "作成者名"):
         return _to_str(norm.get("author"))
     if col_name == "開催日":
-        return _format_date(norm.get("meeting_date"))
+        return _format_date(norm.get("meeting_date"), strict=strict_format)
     if col_name == "開催時間":
         return _to_str(norm.get("meeting_time"))
-    if col_name == "記載者":
+    if col_name in ("記録者", "記載者"):
+        # 「記載者」は旧ヘッダ互換 (現行スキーマは「記録者」)
         return _to_str(norm.get("recorder"))
     if col_name == "開催場所":
         return _to_str(norm.get("location"))
     if col_name == "参加者":
         return _to_participants(norm.get("participants"),
-                                normalize_separators=is_monitoring)
+                                normalize_separators=strict_format)
     if col_name == "同意日":
         return _format_date(norm.get("consent_date"))
     if col_name == "利用者の署名の有無":
