@@ -623,104 +623,156 @@ async def send_prompt(page, prompt: str) -> None:
             cnt = -1
         log.info("[Send] 入力欄候補数: %s = %d", selector, cnt)
 
-    # --- 入力欄が edit-ready になるまで短ポーリング ---
-    # リトライ時など、PDF 再添付直後は入力欄が一時的に触れない状態になる。
-    # editable な要素が出現するまで最大 8 秒、500ms 間隔でポーリング。
+    # 入力欄取得を最大 OUTER_RETRIES 回試す。
+    # 1 回目で成功すれば従来同等の速度。失敗時のみ sleep + 再ポーリング+再セレクタループに入る。
+    # 主に「リトライ経路で PDF 再添付直後に DOM が遷移中で全セレクタ count=0 になる」
+    # ケースを救済する。
+    OUTER_RETRIES = 3
+    OUTER_SLEEP_MS = 6_000
     ready_selectors = [
         '[contenteditable="true"][role="textbox"]',
         "div.ProseMirror[contenteditable='true']",
         "div[contenteditable='true']",
     ]
-    for _ in range(16):  # 16 * 500ms = 8 秒
-        ready = False
-        for rs in ready_selectors:
-            try:
-                loc = page.locator(rs).first
-                if await loc.count() > 0 and await loc.is_editable(timeout=500):
-                    ready = True
-                    break
-            except Exception:
-                continue
-        if ready:
-            log.info("[Send] 入力欄が edit-ready 検知")
-            break
-        await page.wait_for_timeout(500)
-    else:
-        log.warning("[Send] 入力欄 edit-ready タイムアウト (続行)")
 
-    for selector in INPUT_FIELD_SELECTORS:
-        tried_input.append(selector)
-        try:
-            input_el = page.locator(selector).first
-            if await input_el.count() == 0:
-                continue
+    for outer in range(1, OUTER_RETRIES + 1):
+        if outer > 1:
+            log.info("[Send] 入力欄取得 outer-retry %d/%d (sleep %dms)",
+                     outer, OUTER_RETRIES, OUTER_SLEEP_MS)
+            await page.wait_for_timeout(OUTER_SLEEP_MS)
 
-            # 同一セレクタで「フォーカス+入力+検証」を最大 3 回試す
-            # (リトライ時の一時的な入力不可状態を吸収)
-            for attempt in range(1, 4):
-                # フォーカス試行 (click → focus の順でフォールバック)
-                focused = False
+        # --- 入力欄が edit-ready になるまで短ポーリング ---
+        # リトライ時など、PDF 再添付直後は入力欄が一時的に触れない状態になる。
+        # editable な要素が出現するまで最大 8 秒、500ms 間隔でポーリング。
+        for _ in range(16):  # 16 * 500ms = 8 秒
+            ready = False
+            for rs in ready_selectors:
                 try:
-                    await input_el.click(timeout=5_000)
-                    focused = True
-                    log.info("[Send] フォーカス成功 (click, attempt=%d): %s", attempt, selector)
-                except Exception as e_click:
-                    log.debug("[Send] click フォーカス失敗 (%s): %s", selector, e_click)
-                    try:
-                        await input_el.focus(timeout=3_000)
-                        focused = True
-                        log.info("[Send] フォーカス成功 (focus, attempt=%d): %s", attempt, selector)
-                    except Exception as e_focus:
-                        log.debug("[Send] focus も失敗 (%s): %s", selector, e_focus)
-
-                if not focused:
-                    log.info("[Send] フォーカス失敗 (attempt=%d): %s", attempt, selector)
-                    await page.wait_for_timeout(800)
-                    continue
-
-                # 入力試行: keyboard.type → keyboard.insert_text
-                typed = False
-                try:
-                    await page.keyboard.type(prompt, delay=0)
-                    typed = True
-                except Exception as e_type:
-                    log.debug("[Send] keyboard.type 失敗: %s", e_type)
-                    try:
-                        await page.keyboard.insert_text(prompt)
-                        typed = True
-                        log.info("[Send] keyboard.insert_text で入力")
-                    except Exception as e_ins:
-                        log.debug("[Send] insert_text 失敗: %s", e_ins)
-
-                if not typed:
-                    await page.wait_for_timeout(800)
-                    continue
-
-                await page.wait_for_timeout(400)
-
-                # 入力結果検証
-                try:
-                    inner = await input_el.inner_text(timeout=2_000)
+                    loc = page.locator(rs).first
+                    if await loc.count() > 0 and await loc.is_editable(timeout=500):
+                        ready = True
+                        break
                 except Exception:
-                    inner = ""
-                log.info("[Send] 入力文字数: %d (期待: %d, attempt=%d)",
-                         len(inner), len(prompt), attempt)
-                if inner and len(inner) >= 1:
-                    input_ok = True
-                    used_selector = selector
-                    log.info("[Send] 入力成功 (セレクタ: %s, attempt=%d)", selector, attempt)
-                    break
-                # 0 文字だったら、同一セレクタで再フォーカス+再入力
-                log.info("[Send] 入力 0 文字、同セレクタで再試行: %s (attempt=%d)",
-                         selector, attempt)
-                await page.wait_for_timeout(800)
-
-            if input_ok:
+                    continue
+            if ready:
+                log.info("[Send] 入力欄が edit-ready 検知 (outer=%d)", outer)
                 break
-            log.info("[Send] セレクタ変更: %s", selector)
-        except Exception as e:
-            log.debug("[Send] 入力失敗 (%s): %s", selector, e)
-            continue
+            await page.wait_for_timeout(500)
+        else:
+            log.warning("[Send] 入力欄 edit-ready タイムアウト (outer=%d, 続行)", outer)
+
+        for selector in INPUT_FIELD_SELECTORS:
+            if selector not in tried_input:
+                tried_input.append(selector)
+            try:
+                input_el = page.locator(selector).first
+                if await input_el.count() == 0:
+                    continue
+
+                # 同一セレクタで「フォーカス+入力+検証」を最大 3 回試す
+                # (リトライ時の一時的な入力不可状態を吸収)
+                for attempt in range(1, 4):
+                    # フォーカス試行 (click → focus の順でフォールバック)
+                    focused = False
+                    try:
+                        await input_el.click(timeout=5_000)
+                        focused = True
+                        log.info("[Send] フォーカス成功 (click, outer=%d, attempt=%d): %s",
+                                 outer, attempt, selector)
+                    except Exception as e_click:
+                        log.debug("[Send] click フォーカス失敗 (%s): %s", selector, e_click)
+                        try:
+                            await input_el.focus(timeout=3_000)
+                            focused = True
+                            log.info("[Send] フォーカス成功 (focus, outer=%d, attempt=%d): %s",
+                                     outer, attempt, selector)
+                        except Exception as e_focus:
+                            log.debug("[Send] focus も失敗 (%s): %s", selector, e_focus)
+
+                    if not focused:
+                        log.info("[Send] フォーカス失敗 (outer=%d, attempt=%d): %s",
+                                 outer, attempt, selector)
+                        await page.wait_for_timeout(800)
+                        continue
+
+                    # 入力試行: keyboard.type → keyboard.insert_text
+                    typed = False
+                    try:
+                        await page.keyboard.type(prompt, delay=0)
+                        typed = True
+                    except Exception as e_type:
+                        log.debug("[Send] keyboard.type 失敗: %s", e_type)
+                        try:
+                            await page.keyboard.insert_text(prompt)
+                            typed = True
+                            log.info("[Send] keyboard.insert_text で入力")
+                        except Exception as e_ins:
+                            log.debug("[Send] insert_text 失敗: %s", e_ins)
+
+                    if not typed:
+                        await page.wait_for_timeout(800)
+                        continue
+
+                    await page.wait_for_timeout(400)
+
+                    # 入力結果検証
+                    try:
+                        inner = await input_el.inner_text(timeout=2_000)
+                    except Exception:
+                        inner = ""
+                    log.info("[Send] 入力文字数: %d (期待: %d, outer=%d, attempt=%d)",
+                             len(inner), len(prompt), outer, attempt)
+                    if inner and len(inner) >= 1:
+                        input_ok = True
+                        used_selector = selector
+                        log.info("[Send] 入力成功 (セレクタ: %s, outer=%d, attempt=%d)",
+                                 selector, outer, attempt)
+                        break
+
+                    # 0 文字: keyboard 入力が要素に届いていない (focus が別の要素に
+                    # 引っ張られている等)。JS フォールバックで textContent を直接
+                    # 書き込み + input/change イベントを dispatch して同期させる。
+                    try:
+                        await input_el.evaluate(
+                            "(el, text) => {"
+                            "  el.focus();"
+                            "  if (el.isContentEditable) { el.textContent = text; }"
+                            "  else { el.value = text; }"
+                            "  el.dispatchEvent(new InputEvent('input', {bubbles: true, data: text}));"
+                            "  el.dispatchEvent(new Event('change', {bubbles: true}));"
+                            "}",
+                            prompt,
+                        )
+                        await page.wait_for_timeout(400)
+                        try:
+                            inner = await input_el.inner_text(timeout=2_000)
+                        except Exception:
+                            inner = ""
+                        log.info("[Send] JS フォールバック後 入力文字数: %d (outer=%d, attempt=%d)",
+                                 len(inner), outer, attempt)
+                        if inner and len(inner) >= 1:
+                            input_ok = True
+                            used_selector = selector
+                            log.info("[Send] JS フォールバックで入力成功 (セレクタ: %s, outer=%d, attempt=%d)",
+                                     selector, outer, attempt)
+                            break
+                    except Exception as e_js:
+                        log.debug("[Send] JS フォールバック失敗 (%s): %s", selector, e_js)
+
+                    # 0 文字だったら、同一セレクタで再フォーカス+再入力
+                    log.info("[Send] 入力 0 文字、同セレクタで再試行: %s (outer=%d, attempt=%d)",
+                             selector, outer, attempt)
+                    await page.wait_for_timeout(800)
+
+                if input_ok:
+                    break
+                log.info("[Send] セレクタ変更: %s", selector)
+            except Exception as e:
+                log.debug("[Send] 入力失敗 (%s): %s", selector, e)
+                continue
+
+        if input_ok:
+            break
 
     if not input_ok:
         debug = await collect_debug_info(page, "send_input", tried_input)
