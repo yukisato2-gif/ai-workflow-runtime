@@ -75,21 +75,80 @@ JSON 以外の文字を 1 文字たりとも出力してはいけません。
 """
 
 
-def _is_monitoring_main_empty(normalized: dict) -> bool:
-    """monitoring の必須項目 (author / 実施日 / participants / 計画期間 / 次回) が
-    全て空かを判定する。retry_once の発火条件に使う。
+# 帳票ごとの必須項目 (retry_once の発火条件に使う「単一の真実の源」)。
+# 「.」表記でネストパスを示す: 例 "plan_period.start" → normalized["plan_period"]["start"]
+# 将来 YAML 化したい場合はこの dict を外出しして yaml.safe_load にすれば良い。
+REQUIRED_FIELDS: dict[str, list[str]] = {
+    "monitoring": [
+        "author",
+        "implementation_date",
+        "participants",
+        "plan_period.start",
+        "plan_period.end",
+        "next_monitoring_date",
+    ],
+    "meeting_record": [
+        "meeting_date",
+        "meeting_time",
+        "location",
+        "participants",
+        "user_name",
+        "plan_period.start",
+        "plan_period.end",
+    ],
+    "assessment": [
+        "date",
+        "user_name",
+        "home_name",
+    ],
+    "plan_draft": [
+        "home_name",
+        "created_date",
+        "author",
+        "plan_period.start",
+        "plan_period.end",
+    ],
+    "plan_final": [
+        "home_name",
+        "created_date",
+        "author",
+        "plan_period.start",
+        "plan_period.end",
+        "consent_date",
+        "signature",
+        "seal",
+    ],
+}
+
+
+def _missing_required_fields(doc_type: str, normalized: dict) -> list[str]:
+    """指定 doc_type の必須項目のうち、normalized 上で空のものを列挙する。
+
+    retry_once の発火条件 (1 つでも欠損していれば retry) に使う。
+    REQUIRED_FIELDS 未登録の doc_type (unknown 等) は空リストを返す
+    (= retry 発火しない、安全側に倒す)。
+
+    Args:
+        doc_type: 内部 doc_type (assessment / plan_draft / ...)
+        normalized: normalize() で整形済みの dict
+
+    Returns:
+        欠損フィールド名のリスト (順序は REQUIRED_FIELDS の登録順)。
+        空ならすべて埋まっている。
     """
-    pp = normalized.get("plan_period") or {}
-    if not isinstance(pp, dict):
-        pp = {}
-    return (
-        not normalized.get("author")
-        and not normalized.get("implementation_date")
-        and not normalized.get("participants")
-        and not pp.get("start")
-        and not pp.get("end")
-        and not normalized.get("next_monitoring_date")
-    )
+    missing: list[str] = []
+    for field in REQUIRED_FIELDS.get(doc_type, []):
+        if "." in field:
+            parent, child = field.split(".", 1)
+            sub = normalized.get(parent, {})
+            if not isinstance(sub, dict):
+                sub = {}
+            if not sub.get(child):
+                missing.append(field)
+        else:
+            if not normalized.get(field):
+                missing.append(field)
+    return missing
 
 
 def run_support_plan_workflow(
@@ -209,14 +268,16 @@ def run_support_plan_workflow(
             # 5. 正規化
             normalized = normalize(doc_type, raw)
 
-            # 5.5 monitoring 限定: 必須項目が全て空ならもう 1 回だけ retry。
-            #    上の parse retry が既に発火している場合は budget 消化済みなのでスキップ
-            #    (合計 Claude 呼び出しは PDF あたり最大 2 回)
-            if doc_type == "monitoring" and not retried_once:
-                if _is_monitoring_main_empty(normalized):
+            # 5.5 共通 retry_once: REQUIRED_FIELDS のうち 1 つでも欠損していれば
+            #     強力プロンプトで 1 回だけ再送する (全 5 帳票共通ロジック)。
+            #     上の parse retry が既に発火している場合は budget 消化済みなのでスキップ
+            #     (合計 Claude 呼び出しは PDF あたり最大 2 回)
+            if not retried_once:
+                missing = _missing_required_fields(doc_type, normalized)
+                if missing:
                     logger.info(
-                        "retry_once: monitoring main fields all empty "
-                        "→ 強力プロンプトで 1 回だけ再送"
+                        "retry_once: required fields missing → retry (%s)",
+                        ", ".join(missing),
                     )
                     retry_wait = POST_CLAUDE_SLEEP_SEC * 3
                     time.sleep(retry_wait)
@@ -225,17 +286,21 @@ def run_support_plan_workflow(
                         time.sleep(POST_CLAUDE_SLEEP_SEC)
                         raw_retry = parse_claude_response(retry_response)
                         normalized_retry = normalize(doc_type, raw_retry)
-                        # retry 結果が「main 空」改善するなら採用、悪化しないなら採用
-                        # (どちらも空でも normalizer の review_required で missing 化される)
+                        # retry 結果を採用 (改善しなくても normalizer の missing_fields
+                        # 機構で N 列に正しく出力される)
                         normalized = normalized_retry
-                        if not _is_monitoring_main_empty(normalized_retry):
-                            logger.info("retry_once: 主要項目が埋まりました")
+                        missing_after = _missing_required_fields(doc_type, normalized_retry)
+                        if not missing_after:
+                            logger.info("retry_once: required fields fulfilled")
                         else:
-                            logger.info("retry_once: 改善せず (missing_fields 行き)")
+                            logger.info(
+                                "retry_once: still missing → %s",
+                                ", ".join(missing_after),
+                            )
                     except Exception as retry_err:
                         logger.warning(
-                            "retry_once failed (parse/runner エラー): %s "
-                            "→ 1 回目の normalized で続行", retry_err
+                            "retry_once failed: %s → fallback to first result",
+                            retry_err,
                         )
 
             # 6. シート追記
