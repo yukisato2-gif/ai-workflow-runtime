@@ -63,7 +63,8 @@ COLUMN_MAPPINGS: dict[str, list[str]] = {
     ],
     "plan_draft": [
         "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別",
-        "ホーム名", "作成日", "計画期間_開始日", "計画期間_終了日", "作成者", "備考",
+        "ホーム名", "作成日", "計画期間_開始日", "計画期間_終了日", "作成者",
+        "抽出できなかった項目", "備考",
     ],
     "meeting_record": [
         "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別",
@@ -219,15 +220,18 @@ def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
     # - 日付列は YYYY/MM(/DD) に厳密一致しない値を空にして missing 化
     # - participants は str 入力時も区切りを「、」に正規化
     # - 拠点 は PDF 親フォルダから補完
-    # monitoring + meeting_record で同等の品質を適用 (他帳票は従来挙動維持)
+    # monitoring + meeting_record + plan_draft で同等品質を適用
+    # (他帳票 assessment / plan_final は従来挙動維持)
     is_monitoring = (doc_type == "monitoring")
     is_meeting_record = (doc_type == "meeting_record")
-    strict_format = is_monitoring or is_meeting_record
+    is_plan_draft = (doc_type == "plan_draft")
+    strict_format = is_monitoring or is_meeting_record or is_plan_draft
 
     # 共通メタ列
     if col_name == "拠点":
-        # 拠点補完は monitoring + meeting_record (他帳票は従来どおり空文字維持)
-        if is_monitoring or is_meeting_record:
+        # 拠点補完は monitoring + meeting_record + plan_draft
+        # (他帳票は従来どおり空文字維持)
+        if is_monitoring or is_meeting_record or is_plan_draft:
             return _derive_site(ctx["pdf_path"])
         return ""
     if col_name == "処理日時":
@@ -254,7 +258,7 @@ def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
     if col_name == "利用者名":
         return _to_str(norm.get("user_name"))
     if col_name == "作成日":
-        return _format_date(norm.get("created_date"))
+        return _format_date(norm.get("created_date"), strict=strict_format)
     if col_name == "計画期間_開始日":
         return _format_date(plan_period.get("start"), strict=strict_format)
     if col_name == "計画期間_終了日":

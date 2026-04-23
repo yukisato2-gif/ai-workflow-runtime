@@ -254,15 +254,26 @@ def normalize(document_type: str, raw: dict) -> dict:
             "created_date", "creation_month", "creation_date",
             "作成月", "作成日",
         ))
-        # 計画期間: 英語キー "plan_period" / 日本語キー "計画期間" 両対応
-        result["plan_period"] = _normalize_plan_period(
-            _first(raw, "plan_period", "計画期間")
-        )
-        result["author"] = _s(_first(
+        # 計画期間: 「plan_period」「計画期間」「計画実施期間」「実施期間」「支援期間」
+        result["plan_period"] = _normalize_plan_period(_first(
+            raw,
+            "plan_period",
+            "計画期間", "計画実施期間", "実施期間", "支援期間",
+        ))
+        # 作成者: 末尾の「（印）」「(印)」「（押印）」等の捺印注記を除去して氏名を残す
+        author_raw = _s(_first(
             raw,
             "author", "service_manager", "creator",
             "サービス管理責任者", "作成者", "記載者",
         ))
+        if author_raw:
+            # 末尾の (印)/（印）/(押印)/（押印あり）/(印影)/（印影） を剥がす
+            author_raw = re.sub(
+                r"\s*[（(](印|押印|押印あり|印影)\s*[)）]\s*$",
+                "",
+                author_raw,
+            ).strip()
+        result["author"] = author_raw
 
         # 主要項目が全て空なら review_required=true に強制
         # (Claude がキー名不一致の別形式で返し、値を拾えなかった場合の救済)
