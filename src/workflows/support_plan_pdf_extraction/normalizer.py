@@ -286,11 +286,16 @@ def normalize(document_type: str, raw: dict) -> dict:
                     )
                     break
         result["plan_period"] = _normalize_plan_period(period_raw)
-        # 作成者: 末尾の「（印）」「(印)」「（押印）」等の捺印注記を除去して氏名を残す
+        # 作成者: 優先順位 (spec)
+        #   サービス管理責任者 > 作成者 > 記入者 > 担当者 > 記載者
+        # 英語別名 (author / service_manager / creator) は最優先の上位互換として
+        # 最前段に置く (Claude がプロンプトどおりに author を返した場合に即採用)。
+        # 末尾の「（印）」「(印)」「（押印）」「（印影）」等の捺印注記は剥がす。
         author_raw = _s(_first(
             raw,
             "author", "service_manager", "creator",
-            "サービス管理責任者", "作成者", "記載者",
+            "サービス管理責任者", "サビ管",
+            "作成者", "記入者", "担当者", "記載者",
         ))
         if author_raw:
             # 末尾の (印)/（印）/(押印)/（押印あり）/(印影)/（印影） を剥がす
