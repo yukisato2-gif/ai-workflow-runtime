@@ -169,12 +169,25 @@ def _format_date(value: Any, strict: bool = False) -> str:
 
 
 def _derive_site(pdf_path: Path) -> str:
-    """拠点列の値を導出する。
+    """拠点列の値を導出する (システム補完、PDF 本文には依拠しない)。
 
-    既存実装で確実な拠点情報を持っていないため、現時点では空文字を返す
-    (既存シートでも空のまま運用されているため整合)。
-    将来的に親フォルダ名等から導出する場合はここを差し替える。
+    PDF 格納パスは典型的に
+        .../GoogleDrive-xxx/共有ドライブ/<拠点名>/<案件フォルダ>/<file>.pdf
+    という構造のため、ファイルの「親の親」フォルダ名 (= parents[1]) を
+    拠点とみなす。一致するフォルダが取れない場合は空文字。
+
+    例: "/.../共有ドライブ/001_100_001_GH平塚/032_個別支援計画関連PDF格納フォルダ/x.pdf"
+        → "001_100_001_GH平塚"
     """
+    try:
+        parents = pdf_path.resolve().parents
+    except Exception:
+        parents = pdf_path.parents
+    if len(parents) >= 2:
+        candidate = parents[1].name
+        # 共有ドライブ 直下の文字列など想定外の場合は空に倒す
+        if candidate and candidate not in ("/", "共有ドライブ", "Shared drives", ""):
+            return candidate
     return ""
 
 
@@ -208,7 +221,10 @@ def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
 
     # 共通メタ列
     if col_name == "拠点":
-        return _derive_site(ctx["pdf_path"])
+        # 拠点補完は monitoring のみ (他帳票は従来どおり空文字維持)
+        if is_monitoring:
+            return _derive_site(ctx["pdf_path"])
+        return ""
     if col_name == "処理日時":
         return ctx["processed_at"]
     if col_name == "ファイル名":

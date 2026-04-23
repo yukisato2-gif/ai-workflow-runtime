@@ -516,11 +516,34 @@ def normalize(document_type: str, raw: dict) -> dict:
         # 計画期間: plan_period / 計画実施期間 / 実施期間 / 支援期間 / 計画期間 のいずれか
         # (内部の start/end のキー揺れは _normalize_plan_period が
         #  start/start_date/開始/開始日 / end/end_date/終了/終了日 を吸収する)
-        result["plan_period"] = _normalize_plan_period(_first(
+        # monitoring 限定: 「2026年3月31日まで」のように末尾の自由語
+        # (まで/迄/頃/予定) が付くケースを _normalize_date 前に除去する
+        period_raw = _first(
             raw,
             "plan_period",
             "計画実施期間", "実施期間", "支援期間", "計画期間",
-        ))
+        )
+        _SUFFIXES = ("まで", "迄", "頃", "予定")
+
+        def _strip_period_suffix(v):
+            if not isinstance(v, str):
+                return v
+            s = v.strip()
+            for suf in _SUFFIXES:
+                if s.endswith(suf):
+                    s = s[:-len(suf)].strip()
+                    break
+            return s
+
+        if isinstance(period_raw, str):
+            # 「A 〜 B」の前後に suffix が付くケース: 分割→各端 strip→再結合
+            parts = re.split(r"\s*[〜～~\-ー－]\s*", period_raw, maxsplit=1)
+            parts = [_strip_period_suffix(p) for p in parts]
+            period_raw = "〜".join(parts) if len(parts) == 2 else parts[0]
+        elif isinstance(period_raw, dict):
+            period_raw = {k: _strip_period_suffix(v) for k, v in period_raw.items()}
+
+        result["plan_period"] = _normalize_plan_period(period_raw)
 
         # 次回モニタリング: 「次回モニタリング時期/予定」「次回予定」「次回実施予定」「次回確認」 等
         result["next_monitoring_date"] = _normalize_date(_first(
