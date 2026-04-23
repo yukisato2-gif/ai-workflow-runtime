@@ -237,10 +237,83 @@ def parse_claude_response(response_text: str) -> dict:
             return {"items": parsed_any}
         logger.error("[Extractor] json parse failed for pattern: array-like candidate")
 
-    # (5) 全滅: 応答全文プレビューをログに残して失敗
+    # (5) fallback: markdown 表 / 「項目: 値」/ 「項目<TAB>値」形式から救済
+    # Claude が JSON 強制指示に従わず markdown 表で返すケース（特に長文 PDF）への
+    # 最終救済。抽出できた key-value を dict にして返す。後段 normalizer の
+    # 日本語キー alias 吸収に任せる。
+    salvaged = _salvage_kv_lines(text)
+    if salvaged:
+        logger.info("[Extractor] kv-line salvage found %d entries", len(salvaged))
+        return salvaged
+
+    # (6) 全滅: 応答全文プレビューをログに残して失敗
     logger.error("[Extractor] all extraction patterns failed")
     logger.error("[Extractor] response first 500 chars:\n%s", text[:500])
     raise WorkflowError(
         f"Claude response is not valid JSON. "
         f"First 100 chars: {text[:100]}"
     )
+
+
+def _salvage_kv_lines(text: str) -> dict:
+    """markdown 表 / 「項目: 値」/ 「項目<TAB>値」形式から key-value を救済する。
+
+    既存の JSON 抽出 (1)-(4) が全失敗した場合の最終 fallback。
+    Claude が自然文混じりの表形式で返すケース（モデル癖）を救済する。
+
+    パース対象:
+    - "| 項目 | 値 |" (markdown table 行)
+    - "項目<TAB>値" (タブ区切り)
+    - "項目: 値" / "項目：値" (半角・全角コロン)
+
+    無視対象:
+    - 空行 / 区切り罫線 ("|---|---|" など)
+    - 値が空 / 値=key と同一
+    - 明らかに本文記述 (文末が句点 "。" 等)
+
+    Returns:
+        抽出できた key-value の dict (1件以上)、抽出ゼロなら空 dict。
+    """
+    result: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        # markdown 表の罫線行 ("|---|---|" 等) はスキップ
+        if re.fullmatch(r"\|?\s*[-:]+\s*(\|\s*[-:]+\s*)+\|?", line):
+            continue
+
+        key: str | None = None
+        value: str | None = None
+
+        # markdown table: "| 項目 | 値 |" → cells = [項目, 値, ...]
+        if line.startswith("|") and line.endswith("|") and line.count("|") >= 3:
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) >= 2 and cells[0] and cells[1]:
+                key, value = cells[0], cells[1]
+        # tab 区切り
+        elif "\t" in line:
+            parts = line.split("\t", 1)
+            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+                key, value = parts[0].strip(), parts[1].strip()
+        # コロン区切り (全角・半角)
+        else:
+            m = re.match(r"^([^\:：]{1,40})[\:：]\s*(.+)$", line)
+            if m and m.group(2).strip():
+                key, value = m.group(1).strip(), m.group(2).strip()
+
+        if not key or not value:
+            continue
+        # 同値・記号のみ・「項目」「内容」のような表ヘッダはスキップ
+        if key == value:
+            continue
+        if key in ("項目", "内容", "key", "value", "Key", "Value"):
+            continue
+        # 本文記述を排除: 値が長く句点で終わる文章はスキップ (キー名側は許容)
+        if len(value) > 200 and value.endswith(("。", ".")):
+            continue
+        # 同一キー重複時は最初の値を優先 (ヘッダ近傍が先に来る想定)
+        if key not in result:
+            result[key] = value
+
+    return result
