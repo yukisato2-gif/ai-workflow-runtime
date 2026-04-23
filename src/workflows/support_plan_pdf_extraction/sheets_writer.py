@@ -1,37 +1,40 @@
-"""個別支援計画 PDF 抽出 workflow 専用 Sheets 追記 (最小版)。
+"""個別支援計画 PDF 抽出 workflow 専用 Sheets 追記。
 
-既存の src/tools/sheets_writer.py とは独立。5帳票を doc_type 別シートに
-分割して append する (運用時の可読性・分析性向上のため)。
-列構成は schema.yaml を参考にしたフラット構造を全シートで共通利用。
+5 帳票を doc_type 別シートに振り分けて append する。
+列構成は **シート毎に異なる** 固定スキーマで、
+COLUMN_MAPPINGS を「単一の真実の源」として保持する。
+
+設計原則:
+- row 生成は必ず固定順配列で行う (dict 順依存禁止)
+- doc_type → 出力シート名 → 列スキーマ の対応を1箇所に集約
+- 列名 (シート列) → normalized キー の対応も1箇所に集約 (_extract_value)
+- 抽出できなかった項目は「備考」に明示的に残す (黙って捨てない)
 
 前提:
 - 環境変数 GOOGLE_APPLICATION_CREDENTIALS: サービスアカウント JSON のパス
 - 環境変数 SUPPORT_PLAN_SHEET_ID: 追記先スプレッドシート ID
 
-シート振り分け (SHEET_NAME_MAP / ERROR_SHEET_NAME を単一の真実の源とする):
-- 内部 doc_type は変更しない (assessment, plan_draft, ...)
-- シート名のみ日本語で別シート化
-- unknown / 例外 failed は「エラーログ」シートに集約
-
-シートが存在しない場合は HEADERS と共に自動作成する。
-
-廃止: 旧 SUPPORT_PLAN_SHEET_NAME (単一シート時代の振り分け先) は読まなくなった。
+廃止: 旧 SUPPORT_PLAN_SHEET_NAME (単一シート時代の振り分け先) は読まれない。
 """
 
 import os
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from src.common import get_logger
 
 logger = get_logger(__name__)
 
 
-# === 振り分けマッピング (単一の真実の源 / 分岐ロジックを分散させない) ===
+# ============================================================================
+# 振り分けマッピング (単一の真実の源)
+# ============================================================================
+
 # 内部 doc_type → 出力先シート名 (日本語)
 SHEET_NAME_MAP: dict[str, str] = {
     "assessment":     "アセスメント",
-    "plan_draft":     "個別支援計画案",
+    "plan_draft":     "個別支援計画書案",
     "meeting_record": "担当者会議録",
     "plan_final":     "個別支援計画書本案",
     "monitoring":     "モニタリング",
@@ -40,103 +43,281 @@ SHEET_NAME_MAP: dict[str, str] = {
 # unknown 種別 / 例外失敗時はここに集約
 ERROR_SHEET_NAME = "エラーログ"
 
-# 列構成 (ヘッダ)
-# 5帳票共通の列 + 各帳票固有の列をまとめたフラットスキーマ
-HEADERS = [
-    "登録日時",                   # A
-    "ファイル名",                 # B
-    "ホーム名",                   # C
-    "書類種別",                   # D
-    "利用者名",                   # E
-    # アセスメント / 会議録 / モニタリング の主日付系
-    "日付_アセスメント",          # F
-    "開催日_会議録",              # G
-    "実施日_モニタリング",        # H
-    "作成日_計画書",              # I
-    # 計画期間
-    "計画期間_開始",              # J
-    "計画期間_終了",              # K
-    # 会議録系
-    "開催時間",                   # L
-    "記載者",                     # M
-    "開催場所",                   # N
-    # 共通 (作成者 / 参加者)
-    "作成者",                     # O
-    "参加者",                     # P
-    # 本案固有
-    "同意日",                     # Q
-    "署名",                       # R
-    "捺印",                       # S
-    # モニタリング固有
-    "次回モニタリング時期",       # T
-    # 共通
-    "review_required",            # U
-    "review_comment",             # V
+# 「書類種別」列に出す日本語ラベル (内部 doc_type は変更しない)
+DOC_TYPE_DISPLAY: dict[str, str] = {
+    "assessment":     "アセスメント",
+    "plan_draft":     "個別支援計画書案",
+    "meeting_record": "担当者会議録",
+    "plan_final":     "個別支援計画書本案",
+    "monitoring":     "モニタリング",
+    "unknown":        "未分類",
+}
+
+# 各 doc_type の出力シートに並ぶ列 (順序固定・実シートのヘッダと完全一致)。
+# ここを編集する以外で列を増減・並び替えしないこと。
+COLUMN_MAPPINGS: dict[str, list[str]] = {
+    "assessment": [
+        "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別",
+        "日付", "利用者名", "ホーム名", "備考",
+    ],
+    "plan_draft": [
+        "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別",
+        "ホーム名", "作成日", "計画期間_開始日", "計画期間_終了日", "作成者", "備考",
+    ],
+    "meeting_record": [
+        "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別",
+        "開催日", "開催時間", "記載者", "開催場所", "参加者",
+        "計画期間_開始日", "計画期間_終了日", "利用者名", "備考",
+    ],
+    "plan_final": [
+        "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別",
+        "ホーム名", "作成日", "計画期間_開始日", "計画期間_終了日",
+        "作成者名", "同意日", "利用者の署名の有無", "利用者の捺印の有無", "備考",
+    ],
+    "monitoring": [
+        "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別",
+        "作成者", "実施日", "参加者",
+        "計画期間_開始日", "計画期間_終了日", "次回モニタリング時期", "備考",
+    ],
+}
+
+# エラーログシート (unknown / 例外失敗用)
+ERROR_LOG_COLUMNS: list[str] = [
+    "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別", "備考",
 ]
 
+# 備考列で「抽出できなかった項目」として列挙する対象列
+# (拠点/処理日時/ファイル名/ファイルID/書類種別/備考 自体は対象外)
+_REMARKS_TRACKABLE_COLS: set[str] = {
+    "日付", "利用者名", "ホーム名", "作成日",
+    "計画期間_開始日", "計画期間_終了日",
+    "作成者", "作成者名",
+    "開催日", "開催時間", "記載者", "開催場所", "参加者",
+    "同意日", "利用者の署名の有無", "利用者の捺印の有無",
+    "実施日", "次回モニタリング時期",
+}
 
-def _get(d: dict, *keys: str, default: str = "") -> str:
-    """dict から key を順に試し、最初に見つかった値を返す。"""
-    for k in keys:
-        if k in d and d[k] not in (None, ""):
-            return str(d[k])
-    return default
+
+# ============================================================================
+# 値の正規化ヘルパ (Sheets 書込前の安全な文字列化)
+# ============================================================================
+
+def _to_str(value: Any) -> str:
+    """None / 数値 / bool / str を安全に文字列化。空白除去のみ。"""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value).strip()
 
 
-def _build_row(pdf_path: Path, normalized: dict) -> list[str]:
-    """正規化済み結果から1行データを構築する。"""
-    doc_type = normalized.get("document_type", "unknown")
-    plan_period = normalized.get("plan_period") or {}
+def _to_participants(value: Any) -> str:
+    """list の場合は読点区切り文字列にする。それ以外は _to_str。
+
+    None や空文字エントリは除去する (str(None) = 'None' をリテラルに
+    残してしまう事故を防ぐ)。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "、".join(
+            str(x).strip()
+            for x in value
+            if x is not None and str(x).strip()
+        )
+    return _to_str(value)
+
+
+def _format_date(value: Any) -> str:
+    """YYYY-MM-DD / YYYY-MM 等を YYYY/MM/DD / YYYY/MM にスラッシュ表記化。
+
+    既存シートが「2025/04/01」形式で書かれているため整合させる。
+    変換不能 (元から自由文) はそのまま返す。
+    """
+    s = _to_str(value)
+    if not s:
+        return ""
+    # YYYY-MM-DD or YYYY-MM (normalizer 出力) → スラッシュに置換
+    # 元値に "-" が含まれていない場合はそのまま
+    if "-" in s and "/" not in s:
+        return s.replace("-", "/")
+    return s
+
+
+def _derive_site(pdf_path: Path) -> str:
+    """拠点列の値を導出する。
+
+    既存実装で確実な拠点情報を持っていないため、現時点では空文字を返す
+    (既存シートでも空のまま運用されているため整合)。
+    将来的に親フォルダ名等から導出する場合はここを差し替える。
+    """
+    return ""
+
+
+# ============================================================================
+# 列名 → 値 抽出 (シート列名と normalized キーの対応を1箇所に集約)
+# ============================================================================
+
+def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
+    """1 つのシート列に対する値を返す。
+
+    sheet 列名と normalized 内部キーの対応 + フォーマットを1箇所に集約。
+    分岐は明示的 if/elif で書き、隠れた魔法的挙動を避ける。
+
+    Args:
+        col_name: シート上の列名 (例: "計画期間_開始日")
+        doc_type: 内部 doc_type (例: "monitoring")
+        ctx: { "pdf_path", "normalized", "processed_at" } を含む dict
+
+    Returns:
+        Sheets セルに書き込む文字列 (空文字 OK)。
+    """
+    norm: dict = ctx["normalized"]
+    plan_period = norm.get("plan_period") or {}
     if not isinstance(plan_period, dict):
         plan_period = {}
 
-    return [
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),      # A 登録日時
-        pdf_path.name,                                     # B ファイル名
-        _get(normalized, "home_name"),                     # C ホーム名
-        doc_type,                                          # D 書類種別
-        _get(normalized, "user_name"),                     # E 利用者名
-        _get(normalized, "date") if doc_type == "assessment" else "",           # F
-        _get(normalized, "meeting_date"),                  # G 開催日_会議録
-        _get(normalized, "implementation_date"),           # H 実施日_モニタリング
-        _get(normalized, "created_date"),                  # I 作成日_計画書
-        str(plan_period.get("start", "")),                 # J
-        str(plan_period.get("end", "")),                   # K
-        _get(normalized, "meeting_time"),                  # L
-        _get(normalized, "recorder"),                      # M
-        _get(normalized, "location"),                      # N
-        _get(normalized, "author"),                        # O
-        _get(normalized, "participants"),                  # P
-        _get(normalized, "consent_date"),                  # Q
-        _get(normalized, "signature"),                     # R
-        _get(normalized, "seal"),                          # S
-        _get(normalized, "next_monitoring_date"),          # T
-        "true" if normalized.get("review_required") else "false",  # U
-        _get(normalized, "review_comment"),                # V
-    ]
+    # 共通メタ列
+    if col_name == "拠点":
+        return _derive_site(ctx["pdf_path"])
+    if col_name == "処理日時":
+        return ctx["processed_at"]
+    if col_name == "ファイル名":
+        return ctx["pdf_path"].name
+    if col_name == "ファイルID":
+        # workflow はローカル PDF を入力に取るため、Drive 側のファイル ID は
+        # 持たない。空文字を返し、推測値を入れない。
+        return ""
+    if col_name == "書類種別":
+        return DOC_TYPE_DISPLAY.get(doc_type, doc_type)
+    if col_name == "備考":
+        return ctx.get("remarks", "")
 
+    # データ列 (sheet 列名 → normalized キーの明示マッピング)
+    if col_name == "日付":
+        return _format_date(norm.get("date"))
+    if col_name == "ホーム名":
+        return _to_str(norm.get("home_name"))
+    if col_name == "利用者名":
+        return _to_str(norm.get("user_name"))
+    if col_name == "作成日":
+        return _format_date(norm.get("created_date"))
+    if col_name == "計画期間_開始日":
+        return _format_date(plan_period.get("start"))
+    if col_name == "計画期間_終了日":
+        return _format_date(plan_period.get("end"))
+    if col_name in ("作成者", "作成者名"):
+        return _to_str(norm.get("author"))
+    if col_name == "開催日":
+        return _format_date(norm.get("meeting_date"))
+    if col_name == "開催時間":
+        return _to_str(norm.get("meeting_time"))
+    if col_name == "記載者":
+        return _to_str(norm.get("recorder"))
+    if col_name == "開催場所":
+        return _to_str(norm.get("location"))
+    if col_name == "参加者":
+        return _to_participants(norm.get("participants"))
+    if col_name == "同意日":
+        return _format_date(norm.get("consent_date"))
+    if col_name == "利用者の署名の有無":
+        return _to_str(norm.get("signature"))
+    if col_name == "利用者の捺印の有無":
+        return _to_str(norm.get("seal"))
+    if col_name == "実施日":
+        return _format_date(norm.get("implementation_date"))
+    if col_name == "次回モニタリング時期":
+        return _format_date(norm.get("next_monitoring_date"))
+
+    # 未知の列 (定義漏れ): 空文字 + ログ
+    logger.warning("[sheets_writer] unknown column %r for doc_type=%s", col_name, doc_type)
+    return ""
+
+
+def _build_remarks(columns: list[str], doc_type: str, ctx: dict) -> str:
+    """備考列の文字列を生成する。
+
+    - 「備考」「拠点/処理日時/ファイル名/ファイルID/書類種別」以外で
+      抽出値が空のものを「抽出できなかった項目: a, b, c」として列挙
+    - normalized.review_comment がある場合は末尾に追記
+    - 何も書くものが無ければ空文字
+    """
+    missing: list[str] = []
+    for col in columns:
+        if col not in _REMARKS_TRACKABLE_COLS:
+            continue
+        # remarks 自身を含めて再帰しないよう、_extract_value を直接呼ぶ
+        v = _extract_value(col, doc_type, ctx)
+        if not v:
+            missing.append(col)
+
+    parts: list[str] = []
+    if missing:
+        parts.append("抽出できなかった項目: " + ", ".join(missing))
+    review_comment = _to_str(ctx["normalized"].get("review_comment"))
+    if review_comment:
+        parts.append(review_comment)
+    return " / ".join(parts)
+
+
+# ============================================================================
+# row 生成 (固定順配列・dict 順依存なし)
+# ============================================================================
 
 def _resolve_sheet_name(normalized: dict) -> str:
-    """doc_type に応じた出力先シート名を解決する (単一の振り分け関数)。
-
-    - SHEET_NAME_MAP に登録された doc_type → 対応する日本語シート
-    - それ以外 (unknown / 未登録) → ERROR_SHEET_NAME
-
-    Args:
-        normalized: normalize() で整形済みの dict (document_type を含む)。
-
-    Returns:
-        出力先シート名。
-    """
+    """doc_type に応じた出力先シート名を解決する (単一の振り分け関数)。"""
     doc_type = normalized.get("document_type", "unknown")
     return SHEET_NAME_MAP.get(doc_type, ERROR_SHEET_NAME)
 
 
+def _resolve_columns(normalized: dict) -> list[str]:
+    """doc_type に応じた列順 (シート列名のリスト) を返す。"""
+    doc_type = normalized.get("document_type", "unknown")
+    return COLUMN_MAPPINGS.get(doc_type, ERROR_LOG_COLUMNS)
+
+
+def _build_row(pdf_path: Path, normalized: dict) -> tuple[list[str], list[str], str]:
+    """指定シートに対して順序固定の行を生成する。
+
+    Returns:
+        (columns, row, sheet_name)
+        - columns: シート列名リスト (順序固定)
+        - row:     上記順序に厳密一致する値リスト (同じ長さ)
+        - sheet_name: 出力先シート名
+
+    dict 順依存を完全排除するため、columns を先頭から順に走査して
+    row を組み立てる。row 長は必ず len(columns) と一致する。
+    """
+    doc_type = normalized.get("document_type", "unknown")
+    sheet_name = _resolve_sheet_name(normalized)
+    columns = _resolve_columns(normalized)
+    processed_at = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+
+    ctx: dict = {
+        "pdf_path": pdf_path,
+        "normalized": normalized,
+        "processed_at": processed_at,
+        "remarks": "",  # 仮置き、後段で上書き
+    }
+    # 備考は他列の抽出結果に依存するため先に計算してから ctx に注入
+    ctx["remarks"] = _build_remarks(columns, doc_type, ctx)
+
+    row = [_extract_value(col, doc_type, ctx) for col in columns]
+    assert len(row) == len(columns), (
+        f"row/column length mismatch: {len(row)} vs {len(columns)}"
+    )
+    return columns, row, sheet_name
+
+
+# ============================================================================
+# Sheets 追記 (公開 API)
+# ============================================================================
+
 def append_row(pdf_path: Path, normalized: dict) -> None:
     """正規化済み結果を Google Sheets に1行追記する。
 
-    出力先シートは normalized["document_type"] から SHEET_NAME_MAP を引いて
-    自動振り分け。シートが無ければ HEADERS と共に新規作成する。
+    出力先シートは normalized["document_type"] から自動振り分け。
+    シートが無ければそのシート用の列ヘッダで新規作成する。
     失敗してもワークフロー全体は止めず、ログに残す。
 
     Args:
@@ -144,8 +325,6 @@ def append_row(pdf_path: Path, normalized: dict) -> None:
         normalized: normalize() で整形済みの dict。
     """
     sheet_id = os.getenv("SUPPORT_PLAN_SHEET_ID", "")
-    sheet_name = _resolve_sheet_name(normalized)
-
     if not sheet_id:
         logger.error("Sheets append skipped: SUPPORT_PLAN_SHEET_ID not set")
         return
@@ -154,6 +333,13 @@ def append_row(pdf_path: Path, normalized: dict) -> None:
     if not creds_path:
         logger.error("Sheets append skipped: GOOGLE_APPLICATION_CREDENTIALS not set")
         return
+
+    columns, row, sheet_name = _build_row(pdf_path, normalized)
+
+    # 列ズレ検証用の最小ログ (過剰にしない)
+    logger.info("[sheets_writer] doc_type=%s sheet=%s row_len=%d/%d",
+                normalized.get("document_type", "unknown"),
+                sheet_name, len(row), len(columns))
 
     try:
         import gspread
@@ -167,10 +353,11 @@ def append_row(pdf_path: Path, normalized: dict) -> None:
             worksheet = spreadsheet.worksheet(sheet_name)
         except Exception:
             logger.info("Worksheet '%s' not found. Creating with headers.", sheet_name)
-            worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=len(HEADERS))
-            worksheet.append_row(HEADERS, value_input_option="USER_ENTERED")
+            worksheet = spreadsheet.add_worksheet(
+                title=sheet_name, rows=1000, cols=len(columns)
+            )
+            worksheet.append_row(columns, value_input_option="USER_ENTERED")
 
-        row = _build_row(pdf_path, normalized)
         worksheet.append_row(row, value_input_option="USER_ENTERED")
         logger.info("Sheets append success: %s → %s (%s)",
                     sheet_name, sheet_id, pdf_path.name)
