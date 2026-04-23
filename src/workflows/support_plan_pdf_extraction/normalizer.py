@@ -308,6 +308,31 @@ def normalize(document_type: str, raw: dict) -> dict:
         else:
             result["participants"] = _normalize_participants(part_val)
 
+        # Fallback: participants が空の時、Claude が「会議出席者」表の各行を
+        # 個別の「職種 → 氏名」トップレベルキーに分解して返したケースを救済。
+        # 既知の職種キーを raw から拾い集めて、上から順に「、」連結する。
+        if not result["participants"]:
+            _MEETING_ROLE_KEYS = (
+                "サービス管理責任者", "サビ管",
+                "管理者", "施設長", "ホーム長",
+                "生活支援員", "支援員", "世話人",
+                "看護師", "医師",
+                "相談員", "相談支援員", "相談支援専門員",
+                "本人", "ご本人", "利用者",
+                "保護者", "家族", "親族",
+            )
+            collected: list[str] = []
+            for k in _MEETING_ROLE_KEYS:
+                v = raw.get(k)
+                if isinstance(v, str) and v.strip():
+                    collected.append(v.strip())
+                elif isinstance(v, list):
+                    for x in v:
+                        if isinstance(x, str) and x.strip():
+                            collected.append(x.strip())
+            if collected:
+                result["participants"] = "、".join(collected)
+
         # 計画期間 (既存ヘルパーが start/end / start_date/end_date /
         # 開始/終了 / 開始日/終了日 を吸収)
         result["plan_period"] = _normalize_plan_period(
