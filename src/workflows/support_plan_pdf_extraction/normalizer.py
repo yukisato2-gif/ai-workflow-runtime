@@ -254,12 +254,38 @@ def normalize(document_type: str, raw: dict) -> dict:
             "created_date", "creation_month", "creation_date",
             "作成月", "作成日",
         ))
-        # 計画期間: 「plan_period」「計画期間」「計画実施期間」「実施期間」「支援期間」
-        result["plan_period"] = _normalize_plan_period(_first(
+        # 計画期間: 「plan_period」「計画期間」「計画実施期間」「実施期間」
+        # 「支援期間」「サービス提供期間」「契約期間」「期間」
+        period_raw = _first(
             raw,
             "plan_period",
             "計画期間", "計画実施期間", "実施期間", "支援期間",
-        ))
+            "サービス提供期間", "契約期間", "期間",
+        )
+        # Fallback: 明示的な計画期間キーが無い場合、トップレベル文字列値の中から
+        # 「YYYY...〜YYYY...」形式を含むものを採用 (右上 free-text 期間想定)。
+        # 先に「実施日」「開催日」「作成日」等の単一日付キーは除外する。
+        if period_raw is None:
+            _SKIP_KEYS = {
+                "meeting_date", "implementation_date", "created_date",
+                "consent_date", "next_monitoring_date", "date",
+                "実施日", "実施年月日", "開催日", "開催年月日",
+                "作成日", "作成月", "同意日", "次回モニタリング時期",
+            }
+            _PERIOD_RE = re.compile(
+                r"\d{4}[-/年].{0,12}[〜～~\-ー－].{0,12}\d{1,2}[-/月]"
+            )
+            for k, v in raw.items():
+                if k in _SKIP_KEYS:
+                    continue
+                if isinstance(v, str) and _PERIOD_RE.search(v):
+                    period_raw = v
+                    logger.info(
+                        "[normalizer/plan_draft] plan_period free-text fallback: "
+                        "key=%r value=%r", k, v[:80],
+                    )
+                    break
+        result["plan_period"] = _normalize_plan_period(period_raw)
         # 作成者: 末尾の「（印）」「(印)」「（押印）」等の捺印注記を除去して氏名を残す
         author_raw = _s(_first(
             raw,
