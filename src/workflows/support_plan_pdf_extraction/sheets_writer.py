@@ -77,7 +77,8 @@ COLUMN_MAPPINGS: dict[str, list[str]] = {
     "monitoring": [
         "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別",
         "作成者", "実施日", "参加者",
-        "計画期間_開始日", "計画期間_終了日", "次回モニタリング時期", "備考",
+        "計画期間_開始日", "計画期間_終了日", "次回モニタリング時期",
+        "抽出できなかった項目", "備考",
     ],
 }
 
@@ -190,6 +191,9 @@ def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
         return ""
     if col_name == "書類種別":
         return DOC_TYPE_DISPLAY.get(doc_type, doc_type)
+    if col_name == "抽出できなかった項目":
+        # 専用列がある場合: 接頭語なし・読点(、)区切り・field 名のみ
+        return "、".join(ctx.get("missing_fields", []))
     if col_name == "備考":
         return ctx.get("remarks", "")
 
@@ -234,26 +238,36 @@ def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
     return ""
 
 
-def _build_remarks(columns: list[str], doc_type: str, ctx: dict) -> str:
-    """備考列の文字列を生成する。
+def _compute_missing_fields(columns: list[str], doc_type: str, ctx: dict) -> list[str]:
+    """各列のうち、データ列で値が空のものを列名のリストとして返す。
 
-    - 「備考」「拠点/処理日時/ファイル名/ファイルID/書類種別」以外で
-      抽出値が空のものを「抽出できなかった項目: a, b, c」として列挙
-    - normalized.review_comment がある場合は末尾に追記
-    - 何も書くものが無ければ空文字
+    拠点 / 処理日時 / ファイル名 / ファイルID / 書類種別 / 抽出できなかった項目 /
+    備考 などのメタ列は除外。返り値は列定義順を保つ。
     """
     missing: list[str] = []
     for col in columns:
         if col not in _REMARKS_TRACKABLE_COLS:
             continue
-        # remarks 自身を含めて再帰しないよう、_extract_value を直接呼ぶ
         v = _extract_value(col, doc_type, ctx)
         if not v:
             missing.append(col)
+    return missing
 
+
+def _build_remarks(columns: list[str], doc_type: str, ctx: dict) -> str:
+    """「備考」列の文字列を生成する。
+
+    - 専用列「抽出できなかった項目」が COLUMN_MAPPINGS にある場合は
+      備考にはそれを含めず、review_comment のみ
+    - 専用列がない場合は従来どおり「抽出できなかった項目: a, b, c」を含める
+    - 末尾に review_comment を追記
+    """
+    has_dedicated_missing_col = "抽出できなかった項目" in columns
     parts: list[str] = []
-    if missing:
-        parts.append("抽出できなかった項目: " + ", ".join(missing))
+    if not has_dedicated_missing_col:
+        missing = ctx.get("missing_fields", [])
+        if missing:
+            parts.append("抽出できなかった項目: " + ", ".join(missing))
     review_comment = _to_str(ctx["normalized"].get("review_comment"))
     if review_comment:
         parts.append(review_comment)
@@ -297,9 +311,11 @@ def _build_row(pdf_path: Path, normalized: dict) -> tuple[list[str], list[str], 
         "pdf_path": pdf_path,
         "normalized": normalized,
         "processed_at": processed_at,
-        "remarks": "",  # 仮置き、後段で上書き
+        "missing_fields": [],   # 仮置き、後段で上書き
+        "remarks": "",          # 仮置き、後段で上書き
     }
-    # 備考は他列の抽出結果に依存するため先に計算してから ctx に注入
+    # データ列の空項目を先に集計 → missing_fields 専用列 / 備考の両方で利用
+    ctx["missing_fields"] = _compute_missing_fields(columns, doc_type, ctx)
     ctx["remarks"] = _build_remarks(columns, doc_type, ctx)
 
     row = [_extract_value(col, doc_type, ctx) for col in columns]

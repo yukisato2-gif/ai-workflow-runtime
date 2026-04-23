@@ -475,33 +475,44 @@ def normalize(document_type: str, raw: dict) -> dict:
         if isinstance(monitoring_person, dict):
             monitoring_person = monitoring_person.get("氏名") or ""
 
+        # author の優先順位 (上から順):
+        # 1) 既存 author/英語キー
+        # 2) 「作成者」「（作成者）」「担当者」「記入者」「実施者」「記載者」
+        # 3) モニタリング実施者(...) prefix 一致 (上で計算済 monitoring_person)
         result["author"] = _s(_first(
             raw,
             "author", "service_manager", "creator",
-            "作成者", "記載者",
+            "作成者", "（作成者）", "(作成者)",
+            "担当者", "記入者", "実施者", "記載者",
         )) or _s(monitoring_person)
 
+        # 実施日: 「実施日」「実施年月日」「実施日時」 等を吸収
         result["implementation_date"] = _normalize_date(_first(
             raw,
             "implementation_date",
-            "実施日", "モニタリング実施日",
+            "実施日", "実施年月日", "実施日時", "モニタリング実施日",
         ))
 
+        # 参加者: 「参加者」「出席者」「出席者一覧」 等を吸収
         result["participants"] = _normalize_participants(_first(
             raw,
-            "participants", "参加者",
+            "participants",
+            "参加者", "出席者", "出席者一覧",
         ))
 
         # 計画期間: plan_period / 計画実施期間 / 計画期間 のいずれか
+        # (内部の start/end のキー揺れは _normalize_plan_period が
+        #  start/start_date/開始/開始日 / end/end_date/終了/終了日 を吸収する)
         result["plan_period"] = _normalize_plan_period(_first(
             raw, "plan_period", "計画実施期間", "計画期間"
         ))
 
+        # 次回モニタリング: 「次回モニタリング時期/予定」「次回予定」「次回実施予定」 等
         result["next_monitoring_date"] = _normalize_date(_first(
             raw,
             "next_monitoring_date",
-            "次回モニタリング時期", "次回モニタリング予定",
-            "次回実施日", "次回実施時期",
+            "次回モニタリング時期", "次回モニタリング予定", "次回モニタリング",
+            "次回予定", "次回実施予定", "次回実施日", "次回実施時期",
         ))
 
         # 主要項目が全て空なら review_required=true に強制
