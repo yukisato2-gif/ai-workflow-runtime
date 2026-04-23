@@ -371,6 +371,56 @@ def _build_row(pdf_path: Path, normalized: dict) -> tuple[list[str], list[str], 
 
 
 # ============================================================================
+# 重複検出 (monitoring 限定)
+# ============================================================================
+
+def _is_duplicate_monitoring(worksheet, columns: list[str], row: list[str]) -> bool:
+    """monitoring シートで「拠点 + ファイル名」一致行が既に存在するか判定。
+
+    呼び出し元で doc_type == "monitoring" を確認してから呼ぶこと。
+
+    Args:
+        worksheet: gspread Worksheet (monitoring シート)
+        columns:   今回の row に対応する列名リスト
+        row:       これから書き込む値リスト
+
+    Returns:
+        True なら既存に重複あり (append しないこと)。
+        False なら重複なし。
+    """
+    try:
+        site_idx = columns.index("拠点")
+        file_idx = columns.index("ファイル名")
+    except ValueError:
+        # 列定義漏れ時は安全側に倒して「重複なし」扱い (= 通常 append)
+        return False
+
+    new_key = (row[site_idx], row[file_idx])
+    if not new_key[1]:
+        # ファイル名が空の場合は判定不能 → append を許可 (誤検知防止)
+        return False
+
+    try:
+        existing = worksheet.get_values("A:C")  # 拠点 / 処理日時 / ファイル名
+    except Exception as e:
+        logger.warning("[sheets_writer] dup-check fetch failed: %s (proceed to append)", e)
+        return False
+
+    # 1 行目はヘッダなのでスキップ
+    for i, ex in enumerate(existing[1:], start=2):
+        ex_site = ex[0] if len(ex) > 0 else ""
+        ex_file = ex[2] if len(ex) > 2 else ""
+        if (ex_site, ex_file) == new_key:
+            logger.info(
+                "[sheets_writer] duplicate skipped: monitoring "
+                "(拠点=%r, ファイル名=%r) already at row %d",
+                new_key[0], new_key[1], i,
+            )
+            return True
+    return False
+
+
+# ============================================================================
 # Sheets 追記 (公開 API)
 # ============================================================================
 
@@ -418,6 +468,11 @@ def append_row(pdf_path: Path, normalized: dict) -> None:
                 title=sheet_name, rows=1000, cols=len(columns)
             )
             worksheet.append_row(columns, value_input_option="USER_ENTERED")
+
+        # 重複防止 (monitoring 限定): 拠点 + ファイル名 一致なら append しない
+        if normalized.get("document_type") == "monitoring":
+            if _is_duplicate_monitoring(worksheet, columns, row):
+                return
 
         worksheet.append_row(row, value_input_option="USER_ENTERED")
         logger.info("Sheets append success: %s → %s (%s)",
