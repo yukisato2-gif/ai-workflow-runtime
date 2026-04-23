@@ -59,7 +59,8 @@ DOC_TYPE_DISPLAY: dict[str, str] = {
 COLUMN_MAPPINGS: dict[str, list[str]] = {
     "assessment": [
         "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別",
-        "日付", "利用者名", "ホーム名", "備考",
+        "日付", "利用者名", "ホーム名",
+        "抽出できなかった項目", "備考",
     ],
     "plan_draft": [
         "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別",
@@ -236,25 +237,25 @@ def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
     if not isinstance(plan_period, dict):
         plan_period = {}
 
-    # 仕上げフラグ:
+    # 仕上げフラグ: 全 5 帳票で同等品質 (現時点で対象外の doc_type は無し)
     # - 日付列は YYYY/MM(/DD) に厳密一致しない値を空にして missing 化
     # - participants は str 入力時も区切りを「、」に正規化
     # - 拠点 は PDF 親フォルダから補完
-    # monitoring + meeting_record + plan_draft + plan_final で同等品質
-    # (assessment は従来挙動維持)
     is_monitoring = (doc_type == "monitoring")
     is_meeting_record = (doc_type == "meeting_record")
     is_plan_draft = (doc_type == "plan_draft")
     is_plan_final = (doc_type == "plan_final")
+    is_assessment = (doc_type == "assessment")
     strict_format = (
-        is_monitoring or is_meeting_record or is_plan_draft or is_plan_final
+        is_monitoring or is_meeting_record or is_plan_draft
+        or is_plan_final or is_assessment
     )
 
     # 共通メタ列
     if col_name == "拠点":
-        # 拠点補完は monitoring + meeting_record + plan_draft + plan_final
-        # (assessment は従来どおり空文字維持)
-        if is_monitoring or is_meeting_record or is_plan_draft or is_plan_final:
+        # 拠点補完は全 5 帳票で適用 (PDF 親フォルダから導出)
+        if (is_monitoring or is_meeting_record or is_plan_draft
+                or is_plan_final or is_assessment):
             return _derive_site(ctx["pdf_path"])
         return ""
     if col_name == "処理日時":

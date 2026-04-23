@@ -229,6 +229,42 @@ def normalize(document_type: str, raw: dict) -> dict:
             "ホーム名", "事業所", "事業所名", "グループホーム名",
         ))
 
+        # Fallback: Claude が「氏名 作成日: 2025/3/24 事業所: AMANEKU平塚 …」
+        # のように利用者名セルの値に他フィールドを詰め込んで返すケースを救済。
+        # ラベル付きセグメントを切り出して date / home_name を取り出し、
+        # user_name は氏名部分だけに整形する。
+        if result["user_name"] and re.search(
+            r"(?:作成日|記入日|実施日|事業所(?:名)?|ホーム名|グループホーム名|"
+            r"作成者(?:名)?|担当者|サービス管理責任者)\s*[:：]",
+            result["user_name"],
+        ):
+            label_pat = (
+                r"(作成日|記入日|実施日|事業所(?:名)?|ホーム名|"
+                r"グループホーム名|作成者(?:名)?|担当者|サービス管理責任者)"
+            )
+            parts = re.split(rf"\s*{label_pat}\s*[:：]\s*", result["user_name"])
+            # parts[0] = 氏名、以降は (label, value) ペアで交互に並ぶ
+            if len(parts) >= 3:
+                name_only = parts[0].strip()
+                if name_only:
+                    result["user_name"] = name_only
+                # 後続の (label, value) を順次処理
+                for i in range(1, len(parts) - 1, 2):
+                    label = parts[i]
+                    value = parts[i + 1].strip()
+                    # 末尾は次のラベルまでなので、空白で区切られた最初の語まで
+                    # を value とする (例: "AMANEKU平塚 作成者名" → "AMANEKU平塚")
+                    if " " in value:
+                        value = value.split()[0]
+                    if not value:
+                        continue
+                    if label in ("作成日", "記入日", "実施日") and not result["date"]:
+                        result["date"] = _normalize_date(value)
+                    elif label in (
+                        "事業所", "事業所名", "ホーム名", "グループホーム名"
+                    ) and not result["home_name"]:
+                        result["home_name"] = value
+
         # 主要項目が全て空なら review_required=true に強制
         if (
             not result["date"]
