@@ -75,7 +75,8 @@ COLUMN_MAPPINGS: dict[str, list[str]] = {
     "plan_final": [
         "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別",
         "ホーム名", "作成日", "計画期間_開始日", "計画期間_終了日",
-        "作成者名", "同意日", "利用者の署名の有無", "利用者の捺印の有無", "備考",
+        "作成者", "同意日", "利用者の署名の有無", "利用者の捺印の有無",
+        "抽出できなかった項目", "備考",
     ],
     "monitoring": [
         "拠点", "処理日時", "ファイル名", "ファイルID", "書類種別",
@@ -170,6 +171,25 @@ def _format_date(value: Any, strict: bool = False) -> str:
     return s
 
 
+def _mark_to_yes_no_unclear(value: Any) -> str:
+    """plan_final の署名・捺印列出力用: ○/× → 有/無、空 → 判定不能 に変換。
+
+    normalizer は内部表現として ○/× を返す既存契約。
+    Sheets 出力時のみ「有 / 無 / 判定不能」表記に統一する。
+    既に「有」「無」「判定不能」「あり」「なし」の文字列が来ても
+    安全に正規化する。
+    """
+    s = _to_str(value)
+    if s in ("○", "〇", "有", "あり", "true", "True"):
+        return "有"
+    if s in ("×", "ｘ", "無", "なし", "false", "False"):
+        return "無"
+    if s in ("判定不能",):
+        return "判定不能"
+    # 空 / 不明 / 未確認 / 上記以外 → 判定不能 に倒す
+    return "判定不能"
+
+
 def _derive_site(pdf_path: Path) -> str:
     """拠点列の値を導出する (システム補完、PDF 本文には依拠しない)。
 
@@ -220,18 +240,21 @@ def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
     # - 日付列は YYYY/MM(/DD) に厳密一致しない値を空にして missing 化
     # - participants は str 入力時も区切りを「、」に正規化
     # - 拠点 は PDF 親フォルダから補完
-    # monitoring + meeting_record + plan_draft で同等品質を適用
-    # (他帳票 assessment / plan_final は従来挙動維持)
+    # monitoring + meeting_record + plan_draft + plan_final で同等品質
+    # (assessment は従来挙動維持)
     is_monitoring = (doc_type == "monitoring")
     is_meeting_record = (doc_type == "meeting_record")
     is_plan_draft = (doc_type == "plan_draft")
-    strict_format = is_monitoring or is_meeting_record or is_plan_draft
+    is_plan_final = (doc_type == "plan_final")
+    strict_format = (
+        is_monitoring or is_meeting_record or is_plan_draft or is_plan_final
+    )
 
     # 共通メタ列
     if col_name == "拠点":
-        # 拠点補完は monitoring + meeting_record + plan_draft
-        # (他帳票は従来どおり空文字維持)
-        if is_monitoring or is_meeting_record or is_plan_draft:
+        # 拠点補完は monitoring + meeting_record + plan_draft + plan_final
+        # (assessment は従来どおり空文字維持)
+        if is_monitoring or is_meeting_record or is_plan_draft or is_plan_final:
             return _derive_site(ctx["pdf_path"])
         return ""
     if col_name == "処理日時":
@@ -278,11 +301,11 @@ def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
         return _to_participants(norm.get("participants"),
                                 normalize_separators=strict_format)
     if col_name == "同意日":
-        return _format_date(norm.get("consent_date"))
+        return _format_date(norm.get("consent_date"), strict=strict_format)
     if col_name == "利用者の署名の有無":
-        return _to_str(norm.get("signature"))
+        return _mark_to_yes_no_unclear(norm.get("signature"))
     if col_name == "利用者の捺印の有無":
-        return _to_str(norm.get("seal"))
+        return _mark_to_yes_no_unclear(norm.get("seal"))
     if col_name == "実施日":
         return _format_date(norm.get("implementation_date"), strict=is_monitoring)
     if col_name == "次回モニタリング時期":

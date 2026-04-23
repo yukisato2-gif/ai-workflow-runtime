@@ -478,16 +478,35 @@ def normalize(document_type: str, raw: dict) -> dict:
             "created_date", "creation_date", "creation_month",
             "作成日", "作成月",
         ))
-        result["plan_period"] = _normalize_plan_period(
-            _first(raw, "plan_period", "計画期間")
-        )
+        # 計画期間: 「支援計画期間」「計画実施期間」「実施期間」「支援期間」も吸収
+        result["plan_period"] = _normalize_plan_period(_first(
+            raw,
+            "plan_period",
+            "計画期間", "支援計画期間", "計画実施期間", "実施期間", "支援期間",
+        ))
 
         # 作成者: dict {役職, 氏名, 押印} / {役職名: 氏名} / str を吸収
+        # 優先順: サービス管理責任者 > 作成者 > 記入者 > 担当者 > 記載者
+        # 加えて、Claude が「作成者（サービス管理責任者）」のように括弧付き
+        # キーで返すケースに対応するため、prefix 一致 fallback も持つ。
         author_val = _first(
             raw,
             "author", "service_manager", "creator",
-            "作成者", "サービス管理責任者", "記載者",
+            "サービス管理責任者", "サビ管",
+            "作成者", "記入者", "担当者", "記載者",
         )
+        # Fallback: 上記で拾えない場合、「作成者」「サービス管理責任者」で
+        # 始まるキー (例:「作成者（サービス管理責任者）」「サービス管理責任者(印)」)
+        # を prefix-match で探す
+        if author_val is None:
+            for k, v in raw.items():
+                if not isinstance(k, str):
+                    continue
+                if (k.startswith("作成者") or k.startswith("サービス管理責任者")) \
+                        and v not in (None, ""):
+                    author_val = v
+                    break
+
         author_dict = author_val if isinstance(author_val, dict) else None
         if author_dict is not None:
             # 氏名/name を優先、無ければ最初の非空文字列値 (役職名キーで氏名が値)
@@ -502,6 +521,15 @@ def normalize(document_type: str, raw: dict) -> dict:
             result["author"] = _s(author_name or "")
         else:
             result["author"] = _s(author_val)
+
+        # 末尾の「（印）」「(印)」「（押印）」「（押印あり）」「（印影）」 等の
+        # 捺印注記は剥がして氏名のみ残す (plan_draft と同じ規則)
+        if result["author"]:
+            result["author"] = re.sub(
+                r"\s*[（(](印|押印|押印あり|印影)\s*[)）]\s*$",
+                "",
+                result["author"],
+            ).strip()
 
         # 同意関連: dict {同意日, 利用者確認, 署名, 押印, ...} or フラット
         # キー候補: 同意確認 / 同意 / consent (同意確認 を最優先)
