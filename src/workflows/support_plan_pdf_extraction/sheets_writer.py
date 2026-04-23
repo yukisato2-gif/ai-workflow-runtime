@@ -1,12 +1,21 @@
 """個別支援計画 PDF 抽出 workflow 専用 Sheets 追記 (最小版)。
 
-既存の src/tools/sheets_writer.py とは独立。5帳票を1シートに統合して
-append する。列構成は schema.yaml を参考にしたフラット構造。
+既存の src/tools/sheets_writer.py とは独立。5帳票を doc_type 別シートに
+分割して append する (運用時の可読性・分析性向上のため)。
+列構成は schema.yaml を参考にしたフラット構造を全シートで共通利用。
 
 前提:
 - 環境変数 GOOGLE_APPLICATION_CREDENTIALS: サービスアカウント JSON のパス
 - 環境変数 SUPPORT_PLAN_SHEET_ID: 追記先スプレッドシート ID
-- 環境変数 SUPPORT_PLAN_SHEET_NAME: シート名 (既定 OCR_個別支援計画関連)
+
+シート振り分け (SHEET_NAME_MAP / ERROR_SHEET_NAME を単一の真実の源とする):
+- 内部 doc_type は変更しない (assessment, plan_draft, ...)
+- シート名のみ日本語で別シート化
+- unknown / 例外 failed は「エラーログ」シートに集約
+
+シートが存在しない場合は HEADERS と共に自動作成する。
+
+廃止: 旧 SUPPORT_PLAN_SHEET_NAME (単一シート時代の振り分け先) は読まなくなった。
 """
 
 import os
@@ -18,7 +27,18 @@ from src.common import get_logger
 logger = get_logger(__name__)
 
 
-DEFAULT_SHEET_NAME = "OCR_個別支援計画関連"
+# === 振り分けマッピング (単一の真実の源 / 分岐ロジックを分散させない) ===
+# 内部 doc_type → 出力先シート名 (日本語)
+SHEET_NAME_MAP: dict[str, str] = {
+    "assessment":     "アセスメント",
+    "plan_draft":     "個別支援計画案",
+    "meeting_record": "担当者会議録",
+    "plan_final":     "個別支援計画書本案",
+    "monitoring":     "モニタリング",
+}
+
+# unknown 種別 / 例外失敗時はここに集約
+ERROR_SHEET_NAME = "エラーログ"
 
 # 列構成 (ヘッダ)
 # 5帳票共通の列 + 各帳票固有の列をまとめたフラットスキーマ
@@ -96,9 +116,27 @@ def _build_row(pdf_path: Path, normalized: dict) -> list[str]:
     ]
 
 
+def _resolve_sheet_name(normalized: dict) -> str:
+    """doc_type に応じた出力先シート名を解決する (単一の振り分け関数)。
+
+    - SHEET_NAME_MAP に登録された doc_type → 対応する日本語シート
+    - それ以外 (unknown / 未登録) → ERROR_SHEET_NAME
+
+    Args:
+        normalized: normalize() で整形済みの dict (document_type を含む)。
+
+    Returns:
+        出力先シート名。
+    """
+    doc_type = normalized.get("document_type", "unknown")
+    return SHEET_NAME_MAP.get(doc_type, ERROR_SHEET_NAME)
+
+
 def append_row(pdf_path: Path, normalized: dict) -> None:
     """正規化済み結果を Google Sheets に1行追記する。
 
+    出力先シートは normalized["document_type"] から SHEET_NAME_MAP を引いて
+    自動振り分け。シートが無ければ HEADERS と共に新規作成する。
     失敗してもワークフロー全体は止めず、ログに残す。
 
     Args:
@@ -106,7 +144,7 @@ def append_row(pdf_path: Path, normalized: dict) -> None:
         normalized: normalize() で整形済みの dict。
     """
     sheet_id = os.getenv("SUPPORT_PLAN_SHEET_ID", "")
-    sheet_name = os.getenv("SUPPORT_PLAN_SHEET_NAME", DEFAULT_SHEET_NAME)
+    sheet_name = _resolve_sheet_name(normalized)
 
     if not sheet_id:
         logger.error("Sheets append skipped: SUPPORT_PLAN_SHEET_ID not set")
