@@ -456,6 +456,9 @@ def normalize(document_type: str, raw: dict) -> dict:
         # extractor の kv-line salvage 経由では括弧付きキー
         # (例:「モニタリング実施者(サービス管理責任者)」「モニタリング実施者（サビ管）」)
         # が現れるため、明示的な variation を追加 + prefix 一致での fallback も用意する。
+        # 「実施者」は spec 上 secondary_author (担当者/記入者と同階層) のため
+        # ここには含めない (priority 2 は モニタリング実施者(...) と
+        # サービス管理責任者 のみ)。
         monitoring_person = _first(
             raw,
             "モニタリング実施者",
@@ -463,7 +466,7 @@ def normalize(document_type: str, raw: dict) -> dict:
             "モニタリング実施者（サービス管理責任者）",
             "モニタリング実施者(サビ管)",
             "モニタリング実施者（サビ管）",
-            "サービス管理責任者", "実施者",
+            "サービス管理責任者",
         )
         # 上記で拾えない場合、"モニタリング実施者" で始まるキーを prefix 一致で探す
         # (括弧の文字バリエーションに頑健な fallback)
@@ -475,16 +478,26 @@ def normalize(document_type: str, raw: dict) -> dict:
         if isinstance(monitoring_person, dict):
             monitoring_person = monitoring_person.get("氏名") or ""
 
-        # author の優先順位 (上から順):
-        # 1) 既存 author/英語キー
-        # 2) 「作成者」「（作成者）」「担当者」「記入者」「実施者」「記載者」
-        # 3) モニタリング実施者(...) prefix 一致 (上で計算済 monitoring_person)
-        result["author"] = _s(_first(
+        # author の優先順位 (上から順、明示的に3階層):
+        #   1) 「作成者」/「（作成者）」/英語 author キー (最優先)
+        #   2) 「モニタリング実施者(...)」 (prefix 一致) / 「サービス管理責任者」
+        #      ↑ 上で計算済の monitoring_person がカバー
+        #   3) 「担当者」「記入者」「実施者」「記載者」 (フォールバック)
+        # Spec: 作成者 > モニタリング実施者 > サービス管理責任者 > その他
+        primary_author = _first(
             raw,
             "author", "service_manager", "creator",
             "作成者", "（作成者）", "(作成者)",
+        )
+        secondary_author = _first(
+            raw,
             "担当者", "記入者", "実施者", "記載者",
-        )) or _s(monitoring_person)
+        )
+        result["author"] = (
+            _s(primary_author)
+            or _s(monitoring_person)
+            or _s(secondary_author)
+        )
 
         # 実施日: 「実施日」「実施年月日」「実施日時」 等を吸収
         result["implementation_date"] = _normalize_date(_first(
@@ -493,26 +506,29 @@ def normalize(document_type: str, raw: dict) -> dict:
             "実施日", "実施年月日", "実施日時", "モニタリング実施日",
         ))
 
-        # 参加者: 「参加者」「出席者」「出席者一覧」 等を吸収
+        # 参加者: 「参加者」「出席者」「出席者一覧」「関係者」 等を吸収
         result["participants"] = _normalize_participants(_first(
             raw,
             "participants",
-            "参加者", "出席者", "出席者一覧",
+            "参加者", "出席者", "出席者一覧", "関係者",
         ))
 
-        # 計画期間: plan_period / 計画実施期間 / 計画期間 のいずれか
+        # 計画期間: plan_period / 計画実施期間 / 実施期間 / 支援期間 / 計画期間 のいずれか
         # (内部の start/end のキー揺れは _normalize_plan_period が
         #  start/start_date/開始/開始日 / end/end_date/終了/終了日 を吸収する)
         result["plan_period"] = _normalize_plan_period(_first(
-            raw, "plan_period", "計画実施期間", "計画期間"
+            raw,
+            "plan_period",
+            "計画実施期間", "実施期間", "支援期間", "計画期間",
         ))
 
-        # 次回モニタリング: 「次回モニタリング時期/予定」「次回予定」「次回実施予定」 等
+        # 次回モニタリング: 「次回モニタリング時期/予定」「次回予定」「次回実施予定」「次回確認」 等
         result["next_monitoring_date"] = _normalize_date(_first(
             raw,
             "next_monitoring_date",
             "次回モニタリング時期", "次回モニタリング予定", "次回モニタリング",
-            "次回予定", "次回実施予定", "次回実施日", "次回実施時期",
+            "次回予定", "次回実施予定", "次回確認",
+            "次回実施日", "次回実施時期",
         ))
 
         # 主要項目が全て空なら review_required=true に強制
