@@ -452,10 +452,26 @@ def normalize(document_type: str, raw: dict) -> dict:
         if "文書情報" in raw and isinstance(raw["文書情報"], dict):
             raw = {**raw["文書情報"], **{k: v for k, v in raw.items() if k != "文書情報"}}
 
-        # モニタリング実施者 は dict ({氏名, 役職}) で返ることがあるので氏名を取り出す
+        # モニタリング実施者 は dict ({氏名, 役職}) で返ることがあるので氏名を取り出す。
+        # extractor の kv-line salvage 経由では括弧付きキー
+        # (例:「モニタリング実施者(サービス管理責任者)」「モニタリング実施者（サビ管）」)
+        # が現れるため、明示的な variation を追加 + prefix 一致での fallback も用意する。
         monitoring_person = _first(
-            raw, "モニタリング実施者", "サービス管理責任者", "実施者"
+            raw,
+            "モニタリング実施者",
+            "モニタリング実施者(サービス管理責任者)",
+            "モニタリング実施者（サービス管理責任者）",
+            "モニタリング実施者(サビ管)",
+            "モニタリング実施者（サビ管）",
+            "サービス管理責任者", "実施者",
         )
+        # 上記で拾えない場合、"モニタリング実施者" で始まるキーを prefix 一致で探す
+        # (括弧の文字バリエーションに頑健な fallback)
+        if monitoring_person is None:
+            for k, v in raw.items():
+                if isinstance(k, str) and k.startswith("モニタリング実施者") and v not in (None, ""):
+                    monitoring_person = v
+                    break
         if isinstance(monitoring_person, dict):
             monitoring_person = monitoring_person.get("氏名") or ""
 
