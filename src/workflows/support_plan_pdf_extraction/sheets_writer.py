@@ -18,6 +18,7 @@ COLUMN_MAPPINGS を「単一の真実の源」として保持する。
 """
 
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -112,11 +113,16 @@ def _to_str(value: Any) -> str:
     return str(value).strip()
 
 
-def _to_participants(value: Any) -> str:
-    """list の場合は読点区切り文字列にする。それ以外は _to_str。
+def _to_participants(value: Any, normalize_separators: bool = False) -> str:
+    """list / str を「、」区切り文字列に整形する。
 
-    None や空文字エントリは除去する (str(None) = 'None' をリテラルに
-    残してしまう事故を防ぐ)。
+    - list: None / 空文字要素は除去して 「、」 join
+      (str(None) = 'None' リテラルが混入する事故を防ぐ)
+    - str + normalize_separators=True (monitoring 用):
+      `,` `, ` `，` `；` `; ` `;` ` | ` `|` を全て 「、」 に統一し、
+      連続「、」/前後の「、」を整理する
+    - str + normalize_separators=False (デフォルト・他帳票互換):
+      従来どおり _to_str(value) を返す
     """
     if value is None:
         return ""
@@ -126,22 +132,39 @@ def _to_participants(value: Any) -> str:
             for x in value
             if x is not None and str(x).strip()
         )
-    return _to_str(value)
+    if not normalize_separators:
+        return _to_str(value)
+    s = _to_str(value)
+    if not s:
+        return ""
+    # 区切り正規化 (長いものから順に置換)
+    for sep in (", ", "，", ",", "； ", "; ", "；", ";", " | ", "|"):
+        s = s.replace(sep, "、")
+    return "、".join(p.strip() for p in s.split("、") if p.strip())
 
 
-def _format_date(value: Any) -> str:
+# 厳密モード用: YYYY/MM/DD または YYYY/MM のみ許容
+_STRICT_DATE_RE = re.compile(r"^\d{4}/\d{1,2}(?:/\d{1,2})?$")
+
+
+def _format_date(value: Any, strict: bool = False) -> str:
     """YYYY-MM-DD / YYYY-MM 等を YYYY/MM/DD / YYYY/MM にスラッシュ表記化。
 
     既存シートが「2025/04/01」形式で書かれているため整合させる。
-    変換不能 (元から自由文) はそのまま返す。
+
+    - strict=False (デフォルト・他帳票互換): 変換不能な自由文 (例:
+      「2025年9月頃」「判定不能」) は **そのまま返す**
+    - strict=True (monitoring 用): 上記いずれの形式にも合致しない値は
+      **空文字** を返し、missing_fields 検出に委ねる
     """
     s = _to_str(value)
     if not s:
         return ""
-    # YYYY-MM-DD or YYYY-MM (normalizer 出力) → スラッシュに置換
-    # 元値に "-" が含まれていない場合はそのまま
+    # YYYY-MM-DD / YYYY-MM (normalizer 出力) → スラッシュに置換
     if "-" in s and "/" not in s:
-        return s.replace("-", "/")
+        s = s.replace("-", "/")
+    if strict and not _STRICT_DATE_RE.match(s):
+        return ""
     return s
 
 
@@ -178,6 +201,11 @@ def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
     if not isinstance(plan_period, dict):
         plan_period = {}
 
+    # monitoring の最終仕上げ用フラグ:
+    # - 日付列は YYYY/MM(/DD) に厳密一致しない値を空にして missing 化
+    # - participants は str 入力時も区切りを「、」に正規化
+    is_monitoring = (doc_type == "monitoring")
+
     # 共通メタ列
     if col_name == "拠点":
         return _derive_site(ctx["pdf_path"])
@@ -207,9 +235,9 @@ def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
     if col_name == "作成日":
         return _format_date(norm.get("created_date"))
     if col_name == "計画期間_開始日":
-        return _format_date(plan_period.get("start"))
+        return _format_date(plan_period.get("start"), strict=is_monitoring)
     if col_name == "計画期間_終了日":
-        return _format_date(plan_period.get("end"))
+        return _format_date(plan_period.get("end"), strict=is_monitoring)
     if col_name in ("作成者", "作成者名"):
         return _to_str(norm.get("author"))
     if col_name == "開催日":
@@ -221,7 +249,8 @@ def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
     if col_name == "開催場所":
         return _to_str(norm.get("location"))
     if col_name == "参加者":
-        return _to_participants(norm.get("participants"))
+        return _to_participants(norm.get("participants"),
+                                normalize_separators=is_monitoring)
     if col_name == "同意日":
         return _format_date(norm.get("consent_date"))
     if col_name == "利用者の署名の有無":
@@ -229,9 +258,9 @@ def _extract_value(col_name: str, doc_type: str, ctx: dict) -> str:
     if col_name == "利用者の捺印の有無":
         return _to_str(norm.get("seal"))
     if col_name == "実施日":
-        return _format_date(norm.get("implementation_date"))
+        return _format_date(norm.get("implementation_date"), strict=is_monitoring)
     if col_name == "次回モニタリング時期":
-        return _format_date(norm.get("next_monitoring_date"))
+        return _format_date(norm.get("next_monitoring_date"), strict=is_monitoring)
 
     # 未知の列 (定義漏れ): 空文字 + ログ
     logger.warning("[sheets_writer] unknown column %r for doc_type=%s", col_name, doc_type)
