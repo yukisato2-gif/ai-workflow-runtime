@@ -149,6 +149,32 @@ def _s(value: Any) -> str:
     return str(value).strip()
 
 
+def _split_date_and_time(value: Any) -> tuple[str, str]:
+    """meeting_record 用: 「2025年3月24日 13:30〜14:30」のように
+    開催日キー値に時間が混入しているケースを (date_part, time_part) に分離する。
+
+    - 値が文字列でない / 空 / 時間表記がない → (元値の文字列, "")
+    - 時間表記 (HH:MM[:SS] 〜 HH:MM[:SS] など) を検出した場合のみ分離
+    """
+    if value is None:
+        return "", ""
+    s = str(value).strip()
+    if not s:
+        return "", ""
+    # HH:MM[:SS] 〜/～/~/-/− HH:MM[:SS] (前後に空白可)
+    m = re.search(
+        r"(\d{1,2}:\d{2}(?::\d{2})?\s*[〜～~\-ー－]\s*\d{1,2}:\d{2}(?::\d{2})?)",
+        s,
+    )
+    if m:
+        time_part = m.group(1).strip()
+        date_part = s[: m.start()].strip()
+        # 末尾の助詞「、」「・」「(」 等を削る
+        date_part = re.sub(r"[、,\s\(（]+$", "", date_part)
+        return date_part, time_part
+    return s, ""
+
+
 def _first(raw: dict, *keys: str) -> Any:
     """raw から先頭にヒットしたキーの値を返す (別名キー吸収用)。
 
@@ -254,16 +280,28 @@ def normalize(document_type: str, raw: dict) -> dict:
                 )
 
     elif document_type == "meeting_record":
+        # Claude が「開催情報」dict で開催年月日/開催時間/開催場所をネストして
+        # 返すケースを吸収。文書情報 と同様、外側を優先しつつ raw に flat マージ。
+        if "開催情報" in raw and isinstance(raw["開催情報"], dict):
+            raw = {**raw["開催情報"],
+                   **{k: v for k, v in raw.items() if k != "開催情報"}}
+
         # Claude が日本語キーで返すケースを吸収
         # 開催時間は dict {開始, 終了}、会議出席者は list of dict {職種, 氏名}
         # という複合構造で返ることがある
 
-        # 開催日: 「開催日」「開催年月日」「実施日」「実施日時」 等を吸収
-        result["meeting_date"] = _normalize_date(_first(
+        # 開催日: 「開催日」「開催年月日」「実施日」「実施日時」 等を吸収。
+        # 値が「2025年3月24日 13:30〜14:30」のように日付+時間混在の場合は、
+        # 先頭の日付部分のみ meeting_date に渡し、時間部分は後段の
+        # meeting_time fallback で利用する。
+        date_raw = _first(
             raw, "meeting_date",
             "開催年月日", "開催日",
             "実施日", "実施日時",
-        ))
+        )
+        date_part, time_tail = _split_date_and_time(date_raw)
+        result["meeting_date"] = _normalize_date(date_part)
+
         # 記録者: 「記録者」「作成者」「担当者」「記入者」「記載者」 等を吸収
         # (spec 優先順: 記録者 > 作成者 > 担当者; 旧 「記入者/記載者」 は後方)
         result["recorder"] = _s(_first(
@@ -271,11 +309,20 @@ def normalize(document_type: str, raw: dict) -> dict:
             "記録者", "作成者", "担当者",
             "記入者", "記載者",
         ))
-        result["location"] = _s(_first(raw, "location", "開催場所"))
+        # 開催場所: 「開催場所」「場所」「会場」 等を吸収
+        result["location"] = _s(_first(
+            raw, "location",
+            "開催場所", "場所", "会場",
+        ))
         result["user_name"] = _s(_first(raw, "user_name", "利用者名", "対象者"))
 
-        # 開催時間: dict {開始, 終了} / str どちらでも受ける
-        mt_val = _first(raw, "meeting_time", "開催時間")
+        # 開催時間: 「開催時間」「会議時間」「実施時間」 等を吸収
+        # dict {開始, 終了} / str どちらでも受ける。空なら開催日に混入していた
+        # 時間部分 (上で分離済) を利用。
+        mt_val = _first(
+            raw, "meeting_time",
+            "開催時間", "会議時間", "実施時間",
+        )
         if isinstance(mt_val, dict):
             s = mt_val.get("開始") or mt_val.get("start") or ""
             e = mt_val.get("終了") or mt_val.get("end") or ""
@@ -285,6 +332,8 @@ def normalize(document_type: str, raw: dict) -> dict:
                 result["meeting_time"] = _s(s or e)
         else:
             result["meeting_time"] = _s(mt_val)
+        if not result["meeting_time"] and time_tail:
+            result["meeting_time"] = time_tail
 
         # 参加者: list of dict {職種, 氏名} / list of str / str
         # キー揺れ: 「参加者」「出席者」「出席者一覧」「会議出席者」 等
@@ -321,14 +370,30 @@ def normalize(document_type: str, raw: dict) -> dict:
                 "本人", "ご本人", "利用者",
                 "保護者", "家族", "親族",
             )
+
+            def _is_real_name(s: str) -> bool:
+                """メタ注記 (例:「（記載なし）」「（空欄）」「（出席あり／氏名欄空欄）」)
+                を氏名候補から除外する簡易判定。"""
+                t = s.strip()
+                if not t:
+                    return False
+                # 全角/半角の括弧で囲まれた注記を除外
+                if (t.startswith("（") and t.endswith("）")) or \
+                   (t.startswith("(") and t.endswith(")")):
+                    return False
+                # 注記フレーズを含む値も除外
+                if any(kw in t for kw in ("記載なし", "空欄", "不明", "該当なし", "未記入")):
+                    return False
+                return True
+
             collected: list[str] = []
             for k in _MEETING_ROLE_KEYS:
                 v = raw.get(k)
-                if isinstance(v, str) and v.strip():
+                if isinstance(v, str) and _is_real_name(v):
                     collected.append(v.strip())
                 elif isinstance(v, list):
                     for x in v:
-                        if isinstance(x, str) and x.strip():
+                        if isinstance(x, str) and _is_real_name(x):
                             collected.append(x.strip())
             if collected:
                 result["participants"] = "、".join(collected)
