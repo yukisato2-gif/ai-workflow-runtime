@@ -75,6 +75,23 @@ JSON 以外の文字を 1 文字たりとも出力してはいけません。
 """
 
 
+def _is_monitoring_main_empty(normalized: dict) -> bool:
+    """monitoring の必須項目 (author / 実施日 / participants / 計画期間 / 次回) が
+    全て空かを判定する。retry_once の発火条件に使う。
+    """
+    pp = normalized.get("plan_period") or {}
+    if not isinstance(pp, dict):
+        pp = {}
+    return (
+        not normalized.get("author")
+        and not normalized.get("implementation_date")
+        and not normalized.get("participants")
+        and not pp.get("start")
+        and not pp.get("end")
+        and not normalized.get("next_monitoring_date")
+    )
+
+
 def run_support_plan_workflow(
     folder: Path | None = None,
     state_file: Path | None = None,
@@ -165,6 +182,7 @@ def run_support_plan_workflow(
             logger.info("sleep 終了")
 
             # 4. JSON パース (失敗時は 1 回だけ強力 JSON プロンプトで再送)
+            retried_once = False
             try:
                 raw = parse_claude_response(response)
             except Exception as parse_err:
@@ -185,10 +203,40 @@ def run_support_plan_workflow(
                 # 2 回目も失敗したら例外を再送 (外側の except Exception で捕捉 →
                 # 従来の review_required=true 追記パスへ)
                 raw = parse_claude_response(retry_response)
+                retried_once = True
                 logger.info("リトライで JSON 化成功")
 
             # 5. 正規化
             normalized = normalize(doc_type, raw)
+
+            # 5.5 monitoring 限定: 必須項目が全て空ならもう 1 回だけ retry。
+            #    上の parse retry が既に発火している場合は budget 消化済みなのでスキップ
+            #    (合計 Claude 呼び出しは PDF あたり最大 2 回)
+            if doc_type == "monitoring" and not retried_once:
+                if _is_monitoring_main_empty(normalized):
+                    logger.info(
+                        "retry_once: monitoring main fields all empty "
+                        "→ 強力プロンプトで 1 回だけ再送"
+                    )
+                    retry_wait = POST_CLAUDE_SLEEP_SEC * 3
+                    time.sleep(retry_wait)
+                    try:
+                        retry_response = run_claude_on_pdf(pdf_path, RETRY_JSON_ONLY_PROMPT)
+                        time.sleep(POST_CLAUDE_SLEEP_SEC)
+                        raw_retry = parse_claude_response(retry_response)
+                        normalized_retry = normalize(doc_type, raw_retry)
+                        # retry 結果が「main 空」改善するなら採用、悪化しないなら採用
+                        # (どちらも空でも normalizer の review_required で missing 化される)
+                        normalized = normalized_retry
+                        if not _is_monitoring_main_empty(normalized_retry):
+                            logger.info("retry_once: 主要項目が埋まりました")
+                        else:
+                            logger.info("retry_once: 改善せず (missing_fields 行き)")
+                    except Exception as retry_err:
+                        logger.warning(
+                            "retry_once failed (parse/runner エラー): %s "
+                            "→ 1 回目の normalized で続行", retry_err
+                        )
 
             # 6. シート追記
             append_row(pdf_path, normalized)
