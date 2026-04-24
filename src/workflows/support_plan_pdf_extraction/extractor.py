@@ -246,6 +246,29 @@ def parse_claude_response(response_text: str) -> dict:
         logger.info("[Extractor] kv-line salvage found %d entries", len(salvaged))
         return salvaged
 
+    # (5.5) enhanced kv salvage: 日本語ラベルマップ + 期間分解付きの最終 fallback。
+    # 既存 _salvage_kv_lines が 0 件で空 dict を返した場合のみ発火する。
+    # 既存スキーマ (home_name / created_date / author / plan_period) に合わせて
+    # 値が 1 つでも見つかれば return、全部空なら従来通り (6) で WorkflowError を raise。
+    enhanced = _kv_salvage_enhanced(text)
+    enhanced_pp = enhanced.get("plan_period", {}) or {}
+    if (
+        enhanced.get("home_name")
+        or enhanced.get("created_date")
+        or enhanced.get("author")
+        or enhanced_pp.get("start")
+        or enhanced_pp.get("end")
+    ):
+        logger.info(
+            "[Extractor] enhanced kv salvage produced values: "
+            "home_name=%r created_date=%r author=%r plan_period=%r",
+            enhanced.get("home_name"),
+            enhanced.get("created_date"),
+            enhanced.get("author"),
+            enhanced.get("plan_period"),
+        )
+        return enhanced
+
     # (6) 全滅: 応答全文プレビューをログに残して失敗
     logger.error("[Extractor] all extraction patterns failed")
     logger.error("[Extractor] response first 500 chars:\n%s", text[:500])
@@ -315,5 +338,93 @@ def _salvage_kv_lines(text: str) -> dict:
         # 同一キー重複時は最初の値を優先 (ヘッダ近傍が先に来る想定)
         if key not in result:
             result[key] = value
+
+    return result
+
+
+def _kv_salvage_enhanced(text: str) -> dict:
+    """日本語ラベルマッピング + 期間分解付きの強化 KV salvage (最終 fallback)。
+
+    parse_claude_response の既存 (1)-(5) パスがすべて失敗し、かつ
+    既存 _salvage_kv_lines も 0 件で空 dict を返した場合のみ呼ばれる。
+    既存スキーマ (sheets_writer / normalizer) と整合する以下のキー固定形式で返す:
+
+        {
+          "home_name": "",
+          "created_date": "",
+          "author": "",
+          "plan_period": {"start": "", "end": ""}
+        }
+
+    日付正規化は行わず、検出文字列をそのまま値に格納する (downstream の
+    normalizer に正規化を委ねる)。値が見つからなかったキーは "" のまま。
+    """
+    # ラベル → 正規化キー
+    label_map = {
+        "作成日": "created_date",
+        "作成月": "created_date",
+        "グループホーム名": "home_name",
+        "事業所名": "home_name",
+        "サービス管理責任者": "author",
+        "作成者": "author",
+        "担当者": "author",
+        "計画期間": "plan_period",
+        "支援期間": "plan_period",
+        "対象期間": "plan_period",
+    }
+
+    result: dict = {
+        "home_name": "",
+        "created_date": "",
+        "author": "",
+        "plan_period": {"start": "", "end": ""},
+    }
+
+    # 期間分解用 ("〜" U+301C / "～" U+FF5E / "~" / "-" すべて対応)
+    # "-" だけは前後空白必須 ("2024-04-01" の日付内ハイフンを誤分割しないため)
+    period_split_re = re.compile(r"\s*[〜～~]\s*|\s+-\s+")
+    line_kv_re = re.compile(r"^(.+?)[:：]\s*(.+)$")
+    rule_re = re.compile(r"\|?\s*[-:]+\s*(\|\s*[-:]+\s*)+\|?")
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        # コードフェンス / markdown 罫線はスキップ
+        if line.startswith("```"):
+            continue
+        if rule_re.fullmatch(line):
+            continue
+
+        m = line_kv_re.match(line)
+        if not m:
+            continue
+        # markdown 表セル "| 項目 | 値 |" 形式の両端 "|" を剥がす
+        label = m.group(1).strip().lstrip("|").strip()
+        value = m.group(2).strip().rstrip("|").strip()
+        if not label or not value:
+            continue
+
+        # 完全一致優先 → 前方一致 fallback
+        norm_key = label_map.get(label)
+        if norm_key is None:
+            for lbl, k in label_map.items():
+                if label.startswith(lbl):
+                    norm_key = k
+                    break
+        if norm_key is None:
+            continue
+
+        if norm_key == "plan_period":
+            parts = period_split_re.split(value, maxsplit=1)
+            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+                if not result["plan_period"]["start"]:
+                    result["plan_period"]["start"] = parts[0].strip()
+                if not result["plan_period"]["end"]:
+                    result["plan_period"]["end"] = parts[1].strip()
+        else:
+            # 同一キー重複時は最初の値を優先
+            if not result.get(norm_key):
+                result[norm_key] = value
 
     return result
