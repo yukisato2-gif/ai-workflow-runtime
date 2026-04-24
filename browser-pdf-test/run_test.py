@@ -695,19 +695,40 @@ async def send_prompt(page, prompt: str) -> None:
                         await page.wait_for_timeout(800)
                         continue
 
-                    # 入力試行: keyboard.type → keyboard.insert_text
+                    # 入力試行: JS evaluate (PRIMARY) → keyboard.type → keyboard.insert_text
+                    # PRIMARY: 既存 JS フォールバック (下方) と同じロジックを最初に試行する。
+                    # 長文プロンプトでの keyboard.type 欠落 (ratio≈0.92) を防ぐため、
+                    # contenteditable には textContent 直接代入 + InputEvent dispatch する。
                     typed = False
                     try:
-                        await page.keyboard.type(prompt, delay=0)
+                        await input_el.evaluate(
+                            "(el, text) => {"
+                            "  el.focus();"
+                            "  if (el.isContentEditable) { el.textContent = text; }"
+                            "  else { el.value = text; }"
+                            "  el.dispatchEvent(new InputEvent('input', {bubbles: true, data: text}));"
+                            "  el.dispatchEvent(new Event('change', {bubbles: true}));"
+                            "}",
+                            prompt,
+                        )
                         typed = True
-                    except Exception as e_type:
-                        log.debug("[Send] keyboard.type 失敗: %s", e_type)
+                        log.info("[Send] JS evaluate で入力 (PRIMARY)")
+                    except Exception as e_js_primary:
+                        log.debug("[Send] JS evaluate (PRIMARY) 失敗: %s", e_js_primary)
+
+                    # FALLBACK: keyboard.type → keyboard.insert_text (既存)
+                    if not typed:
                         try:
-                            await page.keyboard.insert_text(prompt)
+                            await page.keyboard.type(prompt, delay=0)
                             typed = True
-                            log.info("[Send] keyboard.insert_text で入力")
-                        except Exception as e_ins:
-                            log.debug("[Send] insert_text 失敗: %s", e_ins)
+                        except Exception as e_type:
+                            log.debug("[Send] keyboard.type 失敗: %s", e_type)
+                            try:
+                                await page.keyboard.insert_text(prompt)
+                                typed = True
+                                log.info("[Send] keyboard.insert_text で入力")
+                            except Exception as e_ins:
+                                log.debug("[Send] insert_text 失敗: %s", e_ins)
 
                     if not typed:
                         await page.wait_for_timeout(800)
@@ -722,6 +743,19 @@ async def send_prompt(page, prompt: str) -> None:
                         inner = ""
                     log.info("[Send] 入力文字数: %d (期待: %d, outer=%d, attempt=%d)",
                              len(inner), len(prompt), outer, attempt)
+                    _ratio = (len(inner) / len(prompt)) if len(prompt) > 0 else 0.0
+                    if _ratio < 0.95:
+                        log.warning(
+                            "[Send] 入力検証: ratio=%.3f (inner=%d / prompt=%d) < 0.95 "
+                            "→ 送信時に切れている可能性 (outer=%d, attempt=%d)",
+                            _ratio, len(inner), len(prompt), outer, attempt,
+                        )
+                    else:
+                        log.info(
+                            "[Send] 入力検証: ratio=%.3f (inner=%d / prompt=%d) >= 0.95 OK "
+                            "(outer=%d, attempt=%d)",
+                            _ratio, len(inner), len(prompt), outer, attempt,
+                        )
                     if inner and len(inner) >= 1:
                         input_ok = True
                         used_selector = selector
@@ -1278,6 +1312,10 @@ def main() -> None:
         log.error(str(e))
         write_error_log(str(e), exc=e)
         sys.exit(1)
+
+    log.info("===== DEBUG: PROMPT START =====")
+    log.info(prompt)
+    log.info("===== DEBUG: PROMPT END =====")
 
     try:
         asyncio.run(run(pdf_path, prompt, output_path))
