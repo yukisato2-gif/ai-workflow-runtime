@@ -7,6 +7,7 @@ JSON ファイルに処理済みファイル識別子 (絶対パス) を保存�
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -15,14 +16,17 @@ from src.common import get_logger
 logger = get_logger(__name__)
 
 
-DEFAULT_STATE_FILE = Path("output") / "support_plan_state.json"
+def _get_state_file():
+    import os
+    from pathlib import Path
+    return Path(os.getenv("STATE_FILE", "output/support_plan_state.json"))
 
 
 class StateStore:
     """処理済みファイル識別子の集合を JSON に保存する最小ストア。"""
 
     def __init__(self, state_file: Path | None = None) -> None:
-        self._state_file = state_file or DEFAULT_STATE_FILE
+        self._state_file = state_file or _get_state_file()
         self._processed: set[str] = set()
         self._load()
 
