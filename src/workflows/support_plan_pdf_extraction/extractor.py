@@ -534,22 +534,6 @@ def _kv_salvage_enhanced(text: str) -> dict:
                 )
                 break
 
-    # author が未取得なら、「氏名 様」パターン (※利用者氏名と紛れる heuristic)
-    if not result["author"]:
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("```"):
-                continue
-            m_n = name_sama_re.search(line)
-            if m_n:
-                cand = re.sub(r"[\s\u3000]+", " ", m_n.group(1)).strip()
-                if cand:
-                    result["author"] = cand
-                    captured.append(
-                        f"author(name+sama heuristic, may be 利用者)={cand!r}"
-                    )
-                    break
-
     if captured:
         logger.info(
             "[Extractor] enhanced salvage captured (%d items): %s",

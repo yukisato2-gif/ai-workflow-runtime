@@ -65,12 +65,32 @@ RETRY_JSON_ONLY_PROMPT = """【最重要・実行モード宣言】
 - 記載がない場合は "" を入れる（nullは禁止）
 - 不明・空欄・該当なしも "" にする
 
-添付されたPDFは個別支援計画関連の業務帳票です。
+添付されたPDFは個別支援計画関連の業務帳票（アセスメント / 個別支援計画書（案 or 本案）/ 担当者会議録 / モニタリング記録 のいずれか）です。
 以下の項目をJSON形式で抽出してください。
 
-あなたはデータ抽出専用エンジンです。
+{
+  "home_name": "",
+  "created_date": "",
+  "author": "",
+  "user_name": "",
+  "date": "",
+  "meeting_date": "",
+  "meeting_time": "",
+  "location": "",
+  "participants": "",
+  "implementation_date": "",
+  "next_monitoring_date": "",
+  "consent_date": "",
+  "signature": "",
+  "seal": "",
+  "plan_period": {
+    "start": "",
+    "end": ""
+  }
+}
 
-添付されたPDFは個別支援計画関連の業務帳票（アセスメント / 個別支援計画書（案 or 本案）/ 担当者会議録 / モニタリング記録 のいずれか）です。
+この中から該当する項目のみ値を入れ、該当しない項目は "" とする。
+
 PDFに記載された情報を、必ずJSONのみで返してください。
 
 重要:
