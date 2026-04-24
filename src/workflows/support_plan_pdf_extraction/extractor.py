@@ -343,7 +343,7 @@ def _salvage_kv_lines(text: str) -> dict:
 
 
 def _kv_salvage_enhanced(text: str) -> dict:
-    """日本語ラベルマッピング + 期間分解付きの強化 KV salvage (最終 fallback)。
+    """日本語ラベルマッピング + 期間分解 + ラベルなし救済付きの強化 KV salvage。
 
     parse_claude_response の既存 (1)-(5) パスがすべて失敗し、かつ
     既存 _salvage_kv_lines も 0 件で空 dict を返した場合のみ呼ばれる。
@@ -355,6 +355,14 @@ def _kv_salvage_enhanced(text: str) -> dict:
           "author": "",
           "plan_period": {"start": "", "end": ""}
         }
+
+    処理の優先順 (Pass1 で取れたものは Pass2/3 で上書きしない):
+      Pass1: 「ラベル: 値」「ラベル：値」(コロン区切り)
+      Pass2: 「ラベル 値」(空白区切り、ラベル正規化済み)
+      Pass3: ラベルなし heuristics
+        - 「〜」「～」「~」「 - 」を含み両側に数字を含む行 → plan_period
+        - 行全体が日付のみ → created_date
+        - 「氏名 様」パターン → author 候補 (※利用者氏名と紛れる可能性あり、ログで明示)
 
     日付正規化は行わず、検出文字列をそのまま値に格納する (downstream の
     normalizer に正規化を委ねる)。値が見つからなかったキーは "" のまま。
@@ -380,32 +388,66 @@ def _kv_salvage_enhanced(text: str) -> dict:
         "plan_period": {"start": "", "end": ""},
     }
 
-    # 期間分解用 ("〜" U+301C / "～" U+FF5E / "~" / "-" すべて対応)
-    # "-" だけは前後空白必須 ("2024-04-01" の日付内ハイフンを誤分割しないため)
+    # 期間分解用 ("〜" U+301C / "～" U+FF5E / "~" / "-" 対応、"-" のみ前後空白必須)
     period_split_re = re.compile(r"\s*[〜～~]\s*|\s+-\s+")
     line_kv_re = re.compile(r"^(.+?)[:：]\s*(.+)$")
     rule_re = re.compile(r"\|?\s*[-:]+\s*(\|\s*[-:]+\s*)+\|?")
+    # コロンなし「ラベル<空白>値」(label_map のキーで前方一致)
+    label_space_re = re.compile(
+        r"^(計画期間|支援期間|対象期間|作成日|作成月|"
+        r"グループホーム名|事業所名|"
+        r"サービス管理責任者|作成者|担当者)[\s\u3000]+(.+)$"
+    )
+    # 行全体が日付 (YYYY/MM/DD, YYYY年M月D日, YYYY-MM-DD, YYYY/MM, YYYY年M月 等)
+    date_only_re = re.compile(
+        r"^[\s\u3000]*"
+        r"(\d{4}\s*[年/.\-]\s*\d{1,2}(?:\s*[月/.\-]\s*\d{1,2}日?)?)"
+        r"[\s\u3000]*$"
+    )
+    # 期間判定 (両側に数字を要求し、誤検出を抑制)
+    has_period_sep_re = re.compile(r"[〜～~]|\s-\s")
+    # 「氏名 様」検出 (漢字/かな 1〜6 文字、姓名間の空白許容)
+    name_sama_re = re.compile(
+        r"([\u3040-\u30ff\u4e00-\u9fff]{1,6}[\s\u3000]?[\u3040-\u30ff\u4e00-\u9fff]{0,6})"
+        r"[\s\u3000]*様"
+    )
 
+    def _norm_label(s: str) -> str:
+        """ラベル文字列の OCR ノイズを吸収 (全角空白除去 + 連続空白圧縮)。値は触らない。"""
+        s = s.replace("\u3000", "")
+        s = re.sub(r"\s+", "", s)
+        return s.strip()
+
+    def _norm_value(s: str) -> str:
+        """値の軽量正規化 (前後 strip + 連続半角空白を 1 つに)。"""
+        s = s.strip().strip("|").strip()
+        s = re.sub(r"[ \t]{2,}", " ", s)
+        return s
+
+    def _split_period(value: str):
+        """期間文字列を (start, end) に分割。両側に数字が無ければ None。"""
+        v = _norm_value(value)
+        parts = period_split_re.split(v, maxsplit=1)
+        if (len(parts) == 2 and parts[0].strip() and parts[1].strip()
+                and re.search(r"\d", parts[0]) and re.search(r"\d", parts[1])):
+            return parts[0].strip(), parts[1].strip()
+        return None
+
+    captured: list[str] = []
+
+    # ===== Pass1: コロン区切り「ラベル: 値」=====
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if not line:
+        if not line or line.startswith("```") or rule_re.fullmatch(line):
             continue
-        # コードフェンス / markdown 罫線はスキップ
-        if line.startswith("```"):
-            continue
-        if rule_re.fullmatch(line):
-            continue
-
         m = line_kv_re.match(line)
         if not m:
             continue
-        # markdown 表セル "| 項目 | 値 |" 形式の両端 "|" を剥がす
-        label = m.group(1).strip().lstrip("|").strip()
-        value = m.group(2).strip().rstrip("|").strip()
-        if not label or not value:
+        label_raw = m.group(1).strip().lstrip("|").strip()
+        value = _norm_value(m.group(2))
+        if not label_raw or not value:
             continue
-
-        # 完全一致優先 → 前方一致 fallback
+        label = _norm_label(label_raw)
         norm_key = label_map.get(label)
         if norm_key is None:
             for lbl, k in label_map.items():
@@ -414,17 +456,107 @@ def _kv_salvage_enhanced(text: str) -> dict:
                     break
         if norm_key is None:
             continue
-
         if norm_key == "plan_period":
-            parts = period_split_re.split(value, maxsplit=1)
-            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            pp = _split_period(value)
+            if pp:
                 if not result["plan_period"]["start"]:
-                    result["plan_period"]["start"] = parts[0].strip()
+                    result["plan_period"]["start"] = pp[0]
+                    captured.append(f"plan_period.start(labeled)={pp[0]!r}")
                 if not result["plan_period"]["end"]:
-                    result["plan_period"]["end"] = parts[1].strip()
+                    result["plan_period"]["end"] = pp[1]
+                    captured.append(f"plan_period.end(labeled)={pp[1]!r}")
         else:
-            # 同一キー重複時は最初の値を優先
             if not result.get(norm_key):
                 result[norm_key] = value
+                captured.append(f"{norm_key}(labeled)={value!r}")
+
+    # ===== Pass2: コロンなし「ラベル<空白>値」=====
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("```") or rule_re.fullmatch(line):
+            continue
+        m_sp = label_space_re.match(line)
+        if not m_sp:
+            continue
+        label = _norm_label(m_sp.group(1))
+        value = _norm_value(m_sp.group(2))
+        norm_key = label_map.get(label)
+        if not norm_key or not value:
+            continue
+        if norm_key == "plan_period":
+            pp = _split_period(value)
+            if pp and not result["plan_period"]["start"]:
+                result["plan_period"]["start"] = pp[0]
+                result["plan_period"]["end"] = pp[1]
+                captured.append(
+                    f"plan_period(label-space)={pp[0]!r}~{pp[1]!r}"
+                )
+        else:
+            if not result.get(norm_key):
+                result[norm_key] = value
+                captured.append(f"{norm_key}(label-space)={value!r}")
+
+    # ===== Pass3: ラベルなし heuristics =====
+    # plan_period が未取得なら、期間セパレータを含む行を探す
+    if not result["plan_period"]["start"]:
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("```") or rule_re.fullmatch(line):
+                continue
+            if not has_period_sep_re.search(line):
+                continue
+            pp = _split_period(line)
+            if pp:
+                result["plan_period"]["start"] = pp[0]
+                result["plan_period"]["end"] = pp[1]
+                captured.append(
+                    f"plan_period(unlabeled-heuristic)={pp[0]!r}~{pp[1]!r}"
+                )
+                break
+    elif not result["plan_period"]["end"]:
+        # start のみある状態は推定せず、ログで顕在化
+        captured.append(
+            f"WARN plan_period.end MISSING "
+            f"(start_only={result['plan_period']['start']!r})"
+        )
+
+    # created_date が未取得なら、日付のみ行を探す
+    if not result["created_date"]:
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("```"):
+                continue
+            m_d = date_only_re.match(line)
+            if m_d:
+                result["created_date"] = m_d.group(1).strip()
+                captured.append(
+                    f"created_date(unlabeled-date-only)={result['created_date']!r}"
+                )
+                break
+
+    # author が未取得なら、「氏名 様」パターン (※利用者氏名と紛れる heuristic)
+    if not result["author"]:
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("```"):
+                continue
+            m_n = name_sama_re.search(line)
+            if m_n:
+                cand = re.sub(r"[\s\u3000]+", " ", m_n.group(1)).strip()
+                if cand:
+                    result["author"] = cand
+                    captured.append(
+                        f"author(name+sama heuristic, may be 利用者)={cand!r}"
+                    )
+                    break
+
+    if captured:
+        logger.info(
+            "[Extractor] enhanced salvage captured (%d items): %s",
+            len(captured),
+            "; ".join(captured),
+        )
+    else:
+        logger.info("[Extractor] enhanced salvage captured nothing")
 
     return result
