@@ -660,55 +660,106 @@ def normalize(document_type: str, raw: dict) -> dict:
         if "文書情報" in raw and isinstance(raw["文書情報"], dict):
             raw = {**raw["文書情報"], **{k: v for k, v in raw.items() if k != "文書情報"}}
 
-        # モニタリング実施者 は dict ({氏名, 役職}) で返ることがあるので氏名を取り出す。
-        # extractor の kv-line salvage 経由では括弧付きキー
-        # (例:「モニタリング実施者(サービス管理責任者)」「モニタリング実施者（サビ管）」)
-        # が現れるため、明示的な variation を追加 + prefix 一致での fallback も用意する。
-        # 「実施者」は spec 上 secondary_author (担当者/記入者と同階層) のため
-        # ここには含めない (priority 2 は モニタリング実施者(...) と
-        # サービス管理責任者 のみ)。
-        monitoring_person = _first(
+        # 参加者の生値を先に取得 (author 汚染チェックに使用)。
+        # 後段で _normalize_participants で正規化されるが、ここでは生値が必要。
+        _participants_raw = _first(
             raw,
-            "モニタリング実施者",
+            "participants",
+            "参加者", "出席者", "出席者一覧", "関係者",
+        )
+
+        def _is_participant_contaminated(name: str) -> bool:
+            """値が参加者欄由来 (役割語混入/「、」区切り/参加者名一致) か判定。
+
+            monitoring の author に参加者欄の支援員名・施設長名・本人 を採用しないための
+            防御フィルタ。author 候補として明らかに不適切な値を除外する。
+            """
+            if not isinstance(name, str):
+                return False
+            s = name.strip()
+            if not s:
+                return False
+            # 「、」「,」区切り → 複数名 = 参加者リスト
+            if "、" in s or "," in s:
+                return True
+            # 役割語が混入 → 参加者欄ラベル
+            for marker in ("支援員", "施設長", "本人", "保護者", "家族", "ご本人"):
+                if marker in s:
+                    return True
+            # 参加者リストに含まれる氏名と完全一致 → 参加者由来
+            if isinstance(_participants_raw, list):
+                for p in _participants_raw:
+                    if isinstance(p, str) and p.strip() == s:
+                        return True
+            elif isinstance(_participants_raw, str):
+                for p in re.split(r"[、,]\s*", _participants_raw):
+                    if p.strip() == s:
+                        return True
+            return False
+
+        def _resolve_author_value(value):
+            """raw value を str author 候補に変換 (dict なら 氏名 を取り出す)。"""
+            if isinstance(value, dict):
+                v = value.get("氏名") or value.get("name") or ""
+                if not v:
+                    for vv in value.values():
+                        if isinstance(vv, str) and vv:
+                            v = vv
+                            break
+                return _s(v)
+            return _s(value)
+
+        # author の優先順位 (上位ほど優先):
+        #   1位: モニタリング実施者（サービス管理責任者） / (サビ管)
+        #        ↑ 帳票上明示の実施者氏名
+        #   2位: モニタリング実施者 (素キー or 1位以外のプレフィックス一致)
+        #   3位: サービス管理責任者
+        #   4位: author / service_manager / creator / 作成者 (Claude canonical キー)
+        #   5位: 記入者 / 記載者
+        #   6位: 担当者 / 実施者
+        # 各候補に対し、参加者欄由来 (支援員/施設長/本人/「、」区切り/
+        # 参加者リスト一致) を _is_participant_contaminated で除外。
+        # 監査帳票の上部押印欄ラベル (管理者/サビ管 単独) は元々候補に入っていない。
+        _p1_keys = {
             "モニタリング実施者(サービス管理責任者)",
             "モニタリング実施者（サービス管理責任者）",
             "モニタリング実施者(サビ管)",
             "モニタリング実施者（サビ管）",
-            "サービス管理責任者",
+        }
+        _p1 = _first(
+            raw,
+            "モニタリング実施者(サービス管理責任者)",
+            "モニタリング実施者（サービス管理責任者）",
+            "モニタリング実施者(サビ管)",
+            "モニタリング実施者（サビ管）",
         )
-        # 上記で拾えない場合、"モニタリング実施者" で始まるキーを prefix 一致で探す
-        # (括弧の文字バリエーションに頑健な fallback)
-        if monitoring_person is None:
+        _p2 = _first(raw, "モニタリング実施者")
+        if _p2 is None:
+            # プレフィックス一致 fallback (priority 1 で拾うキーは除外)
             for k, v in raw.items():
-                if isinstance(k, str) and k.startswith("モニタリング実施者") and v not in (None, ""):
-                    monitoring_person = v
+                if not isinstance(k, str):
+                    continue
+                if k in _p1_keys or k == "モニタリング実施者":
+                    continue
+                if k.startswith("モニタリング実施者") and v not in (None, ""):
+                    _p2 = v
                     break
-        if isinstance(monitoring_person, dict):
-            monitoring_person = monitoring_person.get("氏名") or ""
+        _p3 = _first(raw, "サービス管理責任者")
+        _p4 = _first(
+            raw,
+            "author", "service_manager", "creator",
+            "作成者", "（作成者）", "(作成者)",
+        )
+        _p5 = _first(raw, "記入者", "記載者")
+        _p6 = _first(raw, "担当者", "実施者")
 
-        # author の優先順位 (押印欄ラベルからの誤取得を防ぐため再構成):
-        #   1) 「モニタリング実施者(...)」 (prefix 一致) / 「サービス管理責任者」
-        #      ↑ 上で計算済の monitoring_person がカバー (本文上の実施者氏名)
-        #   2) Claude が canonical な英語キー author / service_manager で
-        #      返した場合の救済 (creator は 作成者 に対応するため monitoring
-        #      では使わない: 押印欄ラベルからの誤取得を避けるため)
-        #   3) 「担当者」「記入者」「実施者」「記載者」 (汎用フォールバック)
-        # Spec: モニタリング実施者 > サービス管理責任者 > author/service_manager > その他
-        # 監査帳票の上部押印欄ラベル (管理者 / サビ管 / 作成者) は
-        # 別人の押印欄であり author に流用しない (誤取得防止)。
-        primary_author = _first(
-            raw,
-            "author", "service_manager",
-        )
-        secondary_author = _first(
-            raw,
-            "担当者", "記入者", "実施者", "記載者",
-        )
-        result["author"] = (
-            _s(monitoring_person)
-            or _s(primary_author)
-            or _s(secondary_author)
-        )
+        # 上位から順に評価し、参加者汚染されていない最初のものを採用
+        result["author"] = ""
+        for _cand in (_p1, _p2, _p3, _p4, _p5, _p6):
+            _v = _resolve_author_value(_cand)
+            if _v and not _is_participant_contaminated(_v):
+                result["author"] = _v
+                break
 
         # 実施日: 「実施日」「実施年月日」「実施日時」 等を吸収
         result["implementation_date"] = _normalize_date(_first(
