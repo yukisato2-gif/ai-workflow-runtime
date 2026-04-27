@@ -686,24 +686,27 @@ def normalize(document_type: str, raw: dict) -> dict:
         if isinstance(monitoring_person, dict):
             monitoring_person = monitoring_person.get("氏名") or ""
 
-        # author の優先順位 (上から順、明示的に3階層):
-        #   1) 「作成者」/「（作成者）」/英語 author キー (最優先)
-        #   2) 「モニタリング実施者(...)」 (prefix 一致) / 「サービス管理責任者」
-        #      ↑ 上で計算済の monitoring_person がカバー
-        #   3) 「担当者」「記入者」「実施者」「記載者」 (フォールバック)
-        # Spec: 作成者 > モニタリング実施者 > サービス管理責任者 > その他
+        # author の優先順位 (押印欄ラベルからの誤取得を防ぐため再構成):
+        #   1) 「モニタリング実施者(...)」 (prefix 一致) / 「サービス管理責任者」
+        #      ↑ 上で計算済の monitoring_person がカバー (本文上の実施者氏名)
+        #   2) Claude が canonical な英語キー author / service_manager で
+        #      返した場合の救済 (creator は 作成者 に対応するため monitoring
+        #      では使わない: 押印欄ラベルからの誤取得を避けるため)
+        #   3) 「担当者」「記入者」「実施者」「記載者」 (汎用フォールバック)
+        # Spec: モニタリング実施者 > サービス管理責任者 > author/service_manager > その他
+        # 監査帳票の上部押印欄ラベル (管理者 / サビ管 / 作成者) は
+        # 別人の押印欄であり author に流用しない (誤取得防止)。
         primary_author = _first(
             raw,
-            "author", "service_manager", "creator",
-            "作成者", "（作成者）", "(作成者)",
+            "author", "service_manager",
         )
         secondary_author = _first(
             raw,
             "担当者", "記入者", "実施者", "記載者",
         )
         result["author"] = (
-            _s(primary_author)
-            or _s(monitoring_person)
+            _s(monitoring_person)
+            or _s(primary_author)
             or _s(secondary_author)
         )
 
